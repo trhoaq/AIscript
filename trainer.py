@@ -46,7 +46,7 @@ class DetectorTrainer:
     def __init__(self, model, train_loader, val_loader, device, config):
         self.model = model.to(device)
         self.train_loader = train_loader
-        self.val_loader = val_loader
+        self.val_loader = val_loader # Storing val_loader
         self.device = device
         self.config = config
         
@@ -85,7 +85,7 @@ class DetectorTrainer:
             self.feature_adapters.train()
 
         total_loss = 0
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} [Train]")
         
         for batch in pbar:
             if batch[0] is None:
@@ -128,6 +128,43 @@ class DetectorTrainer:
             
         self.scheduler.step()
         return total_loss / len(self.train_loader) if len(self.train_loader) > 0 else 0
+
+    def evaluate_epoch(self, epoch):
+        if self.val_loader is None:
+            print("Validation loader not provided. Skipping evaluation.")
+            return None
+
+        self.model.eval()
+        # Adapters should be in eval mode too if they exist
+        if self.feature_adapters:
+            self.feature_adapters.eval()
+
+        total_val_loss = 0
+        pbar = tqdm(self.val_loader, desc=f"Epoch {epoch} [Val]")
+
+        with torch.no_grad():
+            for batch in pbar:
+                if batch[0] is None:
+                    continue
+                images, targets = batch
+                
+                images = torch.stack([img.to(self.device) for img in images])
+                targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
+
+                student_logits, student_regs, student_feats = self.model.forward_logits(images)
+                
+                feat_sizes = [(f.size(2), f.size(3)) for f in student_feats]
+                priors = self.model.anchor_generator.generate(feat_sizes, self.model.img_size, student_logits.device)
+                
+                gt_loss_dict = self.model.multibox_loss(student_logits, student_regs, targets, priors)
+                
+                loss = gt_loss_dict["bbox_regression"] + gt_loss_dict["classification"]
+
+                # Note: No KD loss during evaluation typically
+                total_val_loss += loss.item()
+                pbar.set_postfix(val_loss=loss.item())
+        
+        return total_val_loss / len(self.val_loader) if len(self.val_loader) > 0 else 0
 
     def save_checkpoint(self, path):
         if not os.path.exists(os.path.dirname(path)):
