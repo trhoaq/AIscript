@@ -209,3 +209,7 @@ __marimo__/
 # Else
 data/
 .py
+
+# Ignore all markdown files except README.md
+*.md
+!README.md
