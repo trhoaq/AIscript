@@ -211,4 +211,3 @@ data/
 .py
 
 # Ignore all markdown files except README.md
-planner.md
