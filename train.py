@@ -17,6 +17,20 @@ def main():
     with open("config.json", "r") as f:
         config = json.load(f)
 
+    # Initialize wandb
+    try:
+        import wandb
+        if config.get("wandb_project"):
+            wandb.init(
+                project=config["wandb_project"],
+                name=config.get("wandb_run_name"),
+                config=config
+            )
+    except ImportError:
+        print("Warning: wandb not installed. Skipping wandb initialization.")
+    except Exception as e:
+        print(f"Warning: Failed to initialize wandb: {e}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     img_size = config.get("img_size", 256)
     batch_size = config.get("batch_size", 32)
@@ -107,9 +121,15 @@ def main():
     
     trainer = DetectorTrainer(model, train_loader, val_loader, device, trainer_config)
 
+    # Resume training if checkpoint exists
+    resume_checkpoint = config.get("resume_checkpoint")
+    start_epoch = 0
+    if resume_checkpoint and os.path.exists(resume_checkpoint):
+        start_epoch = trainer.load_checkpoint(resume_checkpoint)
+
     # 6. Training Loop
     print(f"Starting training GhostNet SSD 0.5x on {device}...")
-    for epoch in range(1, trainer_config['epochs'] + 1):
+    for epoch in range(start_epoch + 1, trainer_config['epochs'] + 1):
         train_loss = trainer.train_epoch(epoch)
         if train_loss is not None:
             print(f"Epoch {epoch}/{trainer_config['epochs']} | Train Loss: {train_loss:.4f}")
@@ -138,6 +158,10 @@ def main():
             trainer.epochs_no_improve += 1
             print(f"Validation mAP@0.5 did not improve. Epochs without improvement: {trainer.epochs_no_improve}")
 
+        # Periodic checkpoint saving (every 10 epochs)
+        if epoch % 10 == 0:
+            trainer.save_interval_checkpoints(epoch)
+
         if trainer.epochs_no_improve >= trainer.early_stopping_patience:
             print(f"Early stopping triggered after {trainer.early_stopping_patience} epochs without improvement.")
             if trainer.best_model_state:
@@ -151,6 +175,13 @@ def main():
 
     # Save final model state after training (or early stopping)
     trainer.save_checkpoint(f"models/final_model.pth")
+    
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb.finish()
+    except ImportError:
+        pass
 
 if __name__ == "__main__":
     main()

@@ -27,5 +27,7 @@
   "p_mixup": 0.5,
   "num_workers": 4,
   "early_stopping_patience": 10,
-  "use_pretrained_teacher_backbone": false
+  "use_pretrained_teacher_backbone": true,
+  "wandb_project": "AIscript-Object-Detection",
+  "wandb_run_name": "GhostNet-SSD-v1"
 }

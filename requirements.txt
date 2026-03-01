@@ -8,4 +8,6 @@ requests>=2.0.0
 numpy>=1.20.0
 timm>=0.4.12 
 thop
+wandb
+
 
