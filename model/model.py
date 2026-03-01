@@ -157,7 +157,7 @@ class SSDGhost(nn.Module):
         if self.training and targets is not None:
             return self.multibox_loss(cls_logits, bbox_regs, targets, priors)
 
-        return self.predict(cls_logits, bbox_regs, priors)
+        return self.post_process(cls_logits, bbox_regs, priors)
 
     def _encode(self, gt: torch.Tensor, priors: torch.Tensor) -> torch.Tensor:
         gt_c = _xyxy_to_cxcywh(gt)
@@ -216,7 +216,8 @@ class SSDGhost(nn.Module):
         total_pos = max(1, total_pos)
         return {"bbox_regression": loc_loss / total_pos, "classification": cls_loss / total_pos}
 
-    def predict(self, cls_p, reg_p, priors):
+    def post_process(self, cls_p, reg_p, priors, img_size=None, score_thresh=None):
+        if score_thresh is None: score_thresh = self.score_thresh
         probs = F.softmax(cls_p, dim=-1)
         results = []
         for b in range(cls_p.size(0)):
@@ -225,15 +226,21 @@ class SSDGhost(nn.Module):
             out_boxes, out_scores, out_labels = [], [], []
             for c in range(1, self.num_classes):
                 c_scores = scores[:, c]
-                keep = c_scores > self.score_thresh
+                keep = c_scores > score_thresh
                 if keep.sum() == 0: continue
                 c_boxes, c_scores = boxes[keep], c_scores[keep]
                 keep_idx = nms(c_boxes, c_scores, self.nms_thresh)
                 out_boxes.append(c_boxes[keep_idx]); out_scores.append(c_scores[keep_idx])
                 out_labels.append(torch.full((keep_idx.numel(),), c, device=cls_p.device, dtype=torch.long))
+            
             if out_boxes:
-                results.append({"boxes": torch.cat(out_boxes), "scores": torch.cat(out_scores), "labels": torch.cat(out_labels)})
+                # Combine boxes, scores, and labels into a single tensor [N, 6] (x1, y1, x2, y2, score, label)
+                # This matches the loop expectation in trainer.py
+                boxes_cat = torch.cat(out_boxes)
+                scores_cat = torch.cat(out_scores).unsqueeze(1)
+                labels_cat = torch.cat(out_labels).unsqueeze(1).float()
+                results.append(torch.cat([boxes_cat, scores_cat, labels_cat], dim=1))
             else:
-                results.append({"boxes": torch.zeros((0, 4), device=cls_p.device), "scores": torch.zeros(0, device=cls_p.device), "labels": torch.zeros(0, dtype=torch.long, device=cls_p.device)})
+                results.append(torch.zeros((0, 6), device=cls_p.device))
         return results
 
