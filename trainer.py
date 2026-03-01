@@ -209,7 +209,8 @@ class DetectorTrainer:
                 detections = self.model.post_process(student_logits, student_regs, priors, self.model.img_size, self.config['score_thresh'])
                 
                 for i in range(len(detections)):
-                    all_preds.append(detections[i]) # detections[i] is already [N, 6]
+                    # Keep on original device (GPU) to use GPU acceleration for IoU later
+                    all_preds.append(detections[i]) 
                     all_targets.append({
                         "boxes": original_targets[i]["boxes"],
                         "labels": original_targets[i]["labels"],

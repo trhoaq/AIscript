@@ -22,75 +22,81 @@ def _cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
 
 def calculate_stats(preds: List[torch.Tensor], targets: List[dict], iou_threshold: float = 0.5):
     """
-    Calculate True Positives, False Positives and total Ground Truths.
-    preds: List of tensors [N, 6] (x1, y1, x2, y2, score, label)
-    targets: List of dicts {'boxes': [M, 4], 'labels': [M]}
+    Highly optimized calculation of True Positives and scores for mAP, using GPU if available.
     """
     import numpy as np
     from torchvision.ops import box_iou
     
-    # Collect all unique labels from targets
-    all_target_labels = torch.cat([t['labels'] for t in targets])
-    unique_labels = all_target_labels.unique()
-    
-    stats = {}
+    if not preds: return {}
+    device = preds[0].device
 
+    # 1. Pre-group Ground Truths by class and image index
+    gt_by_cls_img = {} # {label: {img_idx: boxes_tensor}}
+    unique_labels = set()
+    
+    for i, t in enumerate(targets):
+        labels = t['labels']
+        boxes = t['boxes'].to(device) # Keep GTs on the same device as preds
+        for label_tensor in labels.unique():
+            label = label_tensor.item()
+            unique_labels.add(label)
+            if label not in gt_by_cls_img: gt_by_cls_img[label] = {}
+            mask = (labels == label)
+            gt_by_cls_img[label][i] = boxes[mask]
+
+    stats = {}
     for label in unique_labels:
-        label = label.item()
-        cls_gts = 0
-        global_cls_preds = []
+        # 2. Collect all predictions for this class
+        cls_preds_list = []
+        total_gt = 0
         
-        # 1. Collect all preds and total gts for this class
-        for i in range(len(preds)):
-            p = preds[i]
-            t = targets[i]
-            
-            # GTs count
-            cls_gts += (t['labels'] == label).sum().item()
-            
-            # Filter preds for this class
-            mask_p = p[:, 5] == label
-            for box_info in p[mask_p]:
-                global_cls_preds.append({
-                    'box': box_info[:4].unsqueeze(0),
-                    'conf': box_info[4].item(),
-                    'img_idx': i
-                })
-        
-        if cls_gts == 0: continue
-        stats[label] = {'tp': [], 'conf': [], 'total_gt': cls_gts}
-        
-        if not global_cls_preds:
+        if label in gt_by_cls_img:
+            for img_idx in gt_by_cls_img[label]:
+                total_gt += len(gt_by_cls_img[label][img_idx])
+
+        for i, p in enumerate(preds):
+            if p.shape[0] == 0: continue
+            mask = (p[:, 5] == label)
+            cls_p = p[mask]
+            if cls_p.shape[0] > 0:
+                img_indices = torch.full((cls_p.shape[0], 1), i, device=device)
+                combined = torch.cat([cls_p[:, 4:5], img_indices, cls_p[:, :4]], dim=1)
+                cls_preds_list.append(combined)
+
+        if total_gt == 0 or not cls_preds_list:
             continue
 
-        # 2. Sort global predictions by confidence
-        global_cls_preds.sort(key=lambda x: x['conf'], reverse=True)
-        
-        # 3. Match with GTs
-        # Track matched GTs per image to avoid double counting
-        image_gts_matched = {} # {img_idx: bitmask_tensor}
-        for i in range(len(targets)):
-            num_gts_in_img = (targets[i]['labels'] == label).sum().item()
-            image_gts_matched[i] = torch.zeros(num_gts_in_img, device=preds[0].device)
+        # 3. Sort global predictions by confidence
+        cls_preds = torch.cat(cls_preds_list, dim=0)
+        sort_idx = torch.argsort(cls_preds[:, 0], descending=True)
+        cls_preds = cls_preds[sort_idx]
 
-        for p_item in global_cls_preds:
-            img_idx = p_item['img_idx']
-            p_box = p_item['box']
-            
-            gt_boxes_img = targets[img_idx]['boxes'][targets[img_idx]['labels'] == label]
+        # 4. Match with GTs (Core matching loop)
+        tp = []
+        conf = []
+        
+        matched_mask = {img_idx: torch.zeros(len(boxes), dtype=torch.bool, device=device) 
+                        for img_idx, boxes in gt_by_cls_img[label].items()}
+
+        for pred in cls_preds:
+            score, img_idx, p_box = pred[0].item(), int(pred[1].item()), pred[2:].unsqueeze(0)
+            conf.append(score)
             
             is_tp = 0
-            if len(gt_boxes_img) > 0:
-                ious = box_iou(p_box, gt_boxes_img)
+            if img_idx in gt_by_cls_img[label]:
+                gt_boxes = gt_by_cls_img[label][img_idx]
+                # box_iou on GPU is extremely fast
+                ious = box_iou(p_box, gt_boxes)
                 best_iou, best_gt_idx = ious.max(1)
                 
                 if best_iou.item() > iou_threshold:
-                    if image_gts_matched[img_idx][best_gt_idx] == 0:
+                    if not matched_mask[img_idx][best_gt_idx]:
                         is_tp = 1
-                        image_gts_matched[img_idx][best_gt_idx] = 1
+                        matched_mask[img_idx][best_gt_idx] = True
             
-            stats[label]['tp'].append(is_tp)
-            stats[label]['conf'].append(p_item['conf'])
+            tp.append(is_tp)
+            
+        stats[label] = {'tp': tp, 'conf': conf, 'total_gt': total_gt}
 
     return stats
 
