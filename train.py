@@ -62,16 +62,18 @@ def main():
     # 3. Model
     num_classes = len(config["obj_classes"])
     model = SSDGhost(num_classes=num_classes, width=0.5, img_size=img_size)
+    model.to(device) # Move model to device BEFORE profiling
 
     # Calculate and log model complexity (total params and MAdds)
     try:
-        from thop import profile
+        from thop import profile, utils # Import utils
         dummy_input = torch.randn(1, 3, img_size, img_size).to(device)
         total_madds, total_params = profile(model, inputs=(dummy_input,), verbose=False)
         print(f"\n--- Model Complexity ---")
         print(f"Total Parameters: {total_params / 1e6:.2f} M")
         print(f"Total MAdds (Giga): {total_madds / 1e9:.2f} G")
         print(f"------------------------\n")
+        utils.remove_hooks(model) # Explicitly remove hooks after profiling
     except ImportError:
         print("Warning: 'thop' library not found. Skipping calculation of model parameters and MAdds.")
         print("Install with: pip install thop")

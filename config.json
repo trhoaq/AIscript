@@ -26,5 +26,6 @@
   "p_mosaic": 0.5,
   "p_mixup": 0.5,
   "num_workers": 4,
-  "early_stopping_patience": 10
+  "early_stopping_patience": 10,
+  "use_pretrained_teacher_backbone": false
 }

@@ -40,6 +40,7 @@ class SSDMobile(nn.Module):
         s_max: float = 0.95,
         score_thresh: float = 0.05,
         nms_thresh: float = 0.5,
+        pretrained_backbone: bool = True, # New parameter
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -49,13 +50,19 @@ class SSDMobile(nn.Module):
         self.nms_thresh = nms_thresh
         self.anchor_generator = DefaultBoxGenerator(aspect_ratios, s_min=s_min, s_max=s_max)
 
-        weights = MobileNet_V3_Large_Weights.DEFAULT
-        backbone = mobilenet_v3_large(weights=weights)
+        # Initialize backbone without pretrained weights initially
+        # Weights will be loaded manually after the model is moved to the target device, if pretrained_backbone is True
+        backbone = mobilenet_v3_large(weights=None) 
         
         # Hard-coded indices for feature extraction from Torchvision's MobileNetV3-Large
         self.backbone = backbone.features
         self.feature_indices = [6, 12, 16] # Indices for C3, C4, C5 layers
         
+        self.pretrained_backbone = pretrained_backbone
+        self.backbone_has_weights_loaded = False
+        if self.pretrained_backbone:
+            self._weights_enum = MobileNet_V3_Large_Weights.DEFAULT
+
         self.fpn_out_channels = 128
         self.lateral_c3 = nn.Conv2d(40, self.fpn_out_channels, kernel_size=1)
         self.lateral_c4 = nn.Conv2d(112, self.fpn_out_channels, kernel_size=1)
@@ -70,6 +77,26 @@ class SSDMobile(nn.Module):
         self.feature_channels = [self.fpn_out_channels] * 6
         self.num_anchors = self.anchor_generator.num_anchors_per_location()
         self.head = SSDHead(self.feature_channels, self.num_anchors, num_classes)
+
+    def load_pretrained_weights(self, device: torch.device):
+        if not self.pretrained_backbone:
+            print("Pretrained backbone disabled. Skipping weight loading.")
+            return
+
+        if self.backbone_has_weights_loaded:
+            print("Pretrained weights already loaded for SSDMobile backbone.")
+            return
+
+        print(f"Loading MobileNetV3 pretrained weights to device: {device}")
+        try:
+            # Download weights on CPU first
+            state_dict = self._weights_enum.get_state_dict(progress=True)
+            self.backbone.load_state_dict(state_dict)
+            self.backbone_has_weights_loaded = True
+            print("Successfully loaded MobileNetV3 pretrained weights.")
+        except Exception as e:
+            print(f"Failed to load MobileNetV3 pretrained weights: {e}")
+            self.backbone_has_weights_loaded = False
 
     def _features(self, x: torch.Tensor) -> List[torch.Tensor]:
         features = []

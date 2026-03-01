@@ -6,6 +6,7 @@ from tqdm import tqdm
 import os
 from typing import List, Dict, Any
 from torchmetrics.detection import MeanAveragePrecision # Import mAP metric
+from model.ssd_custom import SSDMobile
 # You might need to install torchmetrics: pip install torchmetrics torchvision
 
 class DistillationLoss(nn.Module):
@@ -46,22 +47,32 @@ class DistillationLoss(nn.Module):
 
 class DetectorTrainer:
     def __init__(self, model, train_loader, val_loader, device, config):
-        self.model = model.to(device)
+        self.device = device
+        self.model = model.to(self.device) # Move main model to device
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.device = device
         self.config = config
+
+        # If the main model is SSDMobile and pretrained_backbone is enabled, load its pretrained weights
+        from model.ssd_custom import SSDMobile
+        if isinstance(self.model, SSDMobile) and self.model.pretrained_backbone and not self.model.backbone_has_weights_loaded:
+            self.model.load_pretrained_weights(self.device)
         
         # Teacher model for Distillation
         self.teacher_model = config.get('teacher_model')
         self.distill_criterion = None
         self.feature_adapters = None
         
-        params_to_optimize = list(model.parameters())
+        params_to_optimize = list(self.model.parameters())
 
         if self.teacher_model:
-            self.teacher_model.to(device)
+            self.teacher_model.to(self.device)
             self.teacher_model.eval()
+            
+            # If the teacher model is SSDMobile, ensure its weights are loaded
+            if isinstance(self.teacher_model, SSDMobile) and self.teacher_model.pretrained_backbone and not self.teacher_model.backbone_has_weights_loaded:
+                self.teacher_model.load_pretrained_weights(self.device)
+
             self.distill_criterion = DistillationLoss(
                 kd_feature_weight=config.get('kd_feature_weight', 1.0),
                 kd_logit_weight=config.get('kd_logit_weight', 1.0)

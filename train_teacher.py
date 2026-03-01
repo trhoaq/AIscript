@@ -78,23 +78,27 @@ def main():
     # 3. Model (This will be the SSDMobile model)
     num_classes = len(config["obj_classes"])
     teacher_aspect_ratios = [[2], [2, 3], [2, 3], [2, 3], [2], [2]] # SSDMobile's aspect ratios
+    use_pretrained_teacher_backbone = config.get("use_pretrained_teacher_backbone", True) # Default to True
     model = SSDMobile(
         num_classes=num_classes,
         aspect_ratios=teacher_aspect_ratios,
         img_size=img_size,
         s_min=0.07,
         s_max=0.95,
+        pretrained_backbone=use_pretrained_teacher_backbone, # Pass the new parameter
     )
+    model.to(device) # Move model to device BEFORE profiling
 
     # Calculate and log model complexity (total params and MAdds)
     try:
-        from thop import profile
+        from thop import profile, utils # Import utils
         dummy_input = torch.randn(1, 3, img_size, img_size).to(device)
         total_madds, total_params = profile(model, inputs=(dummy_input,), verbose=False)
         print(f"\n--- Teacher Model Complexity ---")
         print(f"Total Parameters: {total_params / 1e6:.2f} M")
         print(f"Total MAdds (Giga): {total_madds / 1e9:.2f} G")
         print(f"--------------------------------\n")
+        utils.remove_hooks(model) # Explicitly remove hooks after profiling
     except ImportError:
         print("Warning: 'thop' library not found. Skipping calculation of teacher model parameters and MAdds.")
         print("Install with: pip install thop")
