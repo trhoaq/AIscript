@@ -31,6 +31,26 @@ class MosaicMixupDataset(Dataset):
         if img is None or target is None: 
             return None, None
 
+        # --- Defensive BBox Filtering before final_transform ---
+        # Ensure boxes and labels are numpy arrays
+        boxes = np.array(target["boxes"], dtype=np.float32)
+        labels = np.array(target["labels"], dtype=np.int64)
+
+        if len(boxes) > 0:
+            # 1. Ensure xmax > xmin and ymax > ymin and area > 1.0 (to avoid division by zero in albumentations)
+            areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+            valid_indices = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1]) & (areas > 1.0)
+            boxes = boxes[valid_indices]
+            labels = labels[valid_indices]
+
+        if len(boxes) == 0:
+            # If no valid boxes left, skip this sample to avoid errors in augmentations
+            return None, None
+            
+        target["boxes"] = boxes
+        target["labels"] = labels
+        # --- End Filtering ---
+
         if self.final_transform:
             transformed = self.final_transform(image=img, bboxes=target["boxes"], class_labels=target["labels"])
             img = transformed["image"]
