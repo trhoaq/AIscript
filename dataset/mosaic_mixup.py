@@ -111,7 +111,7 @@ class MosaicMixupDataset(Dataset):
         r = np.random.beta(1.5, 1.5)
         img = (img1 * r + img2 * (1 - r)).astype(np.uint8)
         
-        boxes = target1["boxes"] + target2["boxes"]
-        labels = target1["labels"] + target2["labels"]
+        boxes = np.concatenate((target1["boxes"], target2["boxes"]), axis=0)
+        labels = np.concatenate((target1["labels"], target2["labels"]), axis=0)
         
         return img, {"boxes": boxes, "labels": labels}

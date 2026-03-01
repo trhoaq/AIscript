@@ -174,8 +174,14 @@ class SSDGhost(nn.Module):
         boxes[:, 2:] = torch.exp(loc[:, 2:] * self.variances[1]) * pr_c[:, 2:]
         return _cxcywh_to_xyxy(boxes)
 
-    def multibox_loss(self, cls_p, reg_p, targets, priors):
+    def multibox_loss(self, cls_p: torch.Tensor, reg_p: torch.Tensor, targets: List[Dict[str, torch.Tensor]], priors: torch.Tensor):
         device = cls_p.device
+        
+        # Defensive device placement for all inputs
+        reg_p = reg_p.to(device)
+        priors = priors.to(device)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
         batch_size = cls_p.size(0)
         loc_loss, cls_loss, total_pos = 0.0, 0.0, 0
         

@@ -4,6 +4,8 @@ import xml.etree.ElementTree as ET
 import json
 import torch
 from torch.utils.data import Dataset, ConcatDataset
+import albumentations as A
+import numpy as np # Move numpy import to the top
 
 # --- Configuration & Mapping ---
 try:
@@ -57,47 +59,97 @@ class PascalVOCDataset(Dataset):
         if img is None: return None, None
         if self.mode == 'RGB': img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
+        # Store image dimensions for albumentations
+        h, w, _ = img.shape # Moved this line up
+
         tree = ET.parse(ann_path)
         boxes, labels = [], []
         for obj in tree.getroot().findall('object'):
             name = obj.find('name').text.strip()
             if name in class_to_idx:
                 bbox = obj.find('bndbox')
-                xmin = float(bbox.find('xmin').text)
-                ymin = float(bbox.find('ymin').text)
-                xmax = float(bbox.find('xmax').text)
-                ymax = float(bbox.find('ymax').text)
-                if xmax > xmin and ymax > ymin:
-                    boxes.append([xmin, ymin, xmax, ymax])
-                    labels.append(class_to_idx[name])
-        
-        if not boxes: return None, None
+                # Pascal VOC coordinates are 1-indexed, so subtract 1 for 0-indexed for albumentations
+                xmin = float(bbox.find('xmin').text) - 1
+                ymin = float(bbox.find('ymin').text) - 1
+                xmax = float(bbox.find('xmax').text) - 1
+                ymax = float(bbox.find('ymax').text) - 1
+                
+                # Ensure valid box (xmin < xmax, ymin < ymax)
+                if xmax <= xmin or ymax <= ymin:
+                    continue
 
-        target = {"boxes": boxes, "labels": labels}
+                # Clamp coordinates to image boundaries to prevent issues with albumentations internal checks
+                xmin = max(0.0, min(xmin, w - 1))
+                ymin = max(0.0, min(ymin, h - 1))
+                xmax = max(0.0, min(xmax, w - 1))
+                ymax = max(0.0, min(ymax, h - 1))
+                
+                # Re-check for valid box after clamping (it might become invalid if original box was very large)
+                if xmax <= xmin or ymax <= ymin:
+                    continue
 
-        # --- Dynamic Padding to Square Based on Max Dimension ---
-        h, w, _ = img.shape
-        max_dim = max(h, w)
+                boxes.append([xmin, ymin, xmax, ymax])
+                labels.append(class_to_idx[name])
         
-        # Apply padding only if necessary (i.e., not already a square)
-        if h != w:
-            temp_pad_transform = A.PadIfNeeded(min_height=max_dim, min_width=max_dim, 
-                                               border_mode=cv2.BORDER_CONSTANT, fill_value=0, p=1.0, 
-                                               bbox_params=A.BboxParams(format="pascal_voc", label_fields=["class_labels"]))
-            
-            padded_result = temp_pad_transform(image=img, bboxes=target["boxes"], class_labels=target["labels"])
-            img = padded_result['image']
-            target['boxes'] = padded_result['bboxes']
-            target['labels'] = padded_result['class_labels']
-        # --- End Dynamic Padding ---
+        if not boxes: return None, None # This check should be after parsing all boxes
+
+        target = {"boxes": np.array(boxes, dtype=np.float32), "labels": np.array(labels, dtype=np.int64)}
         
         if self.transform:
-            transformed = self.transform(image=img, bboxes=target["boxes"], class_labels=target["labels"])
+            transformed = self.transform(image=img, bboxes=target["boxes"], class_labels=target["labels"], height=h, width=w)
             img = transformed['image']
             target['boxes'] = transformed['bboxes']
             target['labels'] = transformed['class_labels']
 
         return img, target
+
+    def __len__(self):
+        return len(self.ids)
+
+def get_voc_datasets(voc_root, img_size, years, transform_train=None, transform_val=None):
+    """
+    Helper function to get combined train and validation datasets for VOC.
+    """
+    train_datasets = []
+    val_datasets = []
+    
+    # Check if root contains years directly
+    # Original train.py defaults: voc_years=["2012"], voc_root="./data/VOC"
+    for year in years:
+        # Check standard VOC structure: root/VOC2012/Images etc.
+        year_path = os.path.join(voc_root, f"VOC{year}")
+        if not os.path.exists(year_path):
+            # Try root/2012 if VOC prefix missing
+            year_path = os.path.join(voc_root, year)
+            if not os.path.exists(year_path):
+                print(f"Warning: VOC {year} folder not found in {voc_root}")
+                continue
+        
+        train_ds = PascalVOCDataset(year_path, image_set='trainval', transform=transform_train)
+        val_ds = PascalVOCDataset(year_path, image_set='val', transform=transform_val)
+        
+        train_datasets.append(train_ds)
+        val_datasets.append(val_ds)
+    
+    if not train_datasets:
+        # Fallback: maybe voc_root IS the dataset folder
+        print(f"No year-specific folders found, trying {voc_root} directly...")
+        train_ds = PascalVOCDataset(voc_root, image_set='trainval', transform=transform_train)
+        val_ds = PascalVOCDataset(voc_root, image_set='val', transform=transform_val)
+        if len(train_ds) > 0:
+            print(f"Total: {len(train_ds)} train samples, {len(val_ds)} val samples.")
+            return train_ds, val_ds
+        else:
+            raise FileNotFoundError(f"No VOC samples found in {voc_root}")
+
+    train_combined = ConcatDataset(train_datasets)
+    val_combined = ConcatDataset(val_datasets)
+    print(f"\n--- Combined Dataset Statistics ---")
+    print(f"Total Combined Train samples: {len(train_combined)}")
+    print(f"Total Combined Val samples: {len(val_combined)}")
+    print(f"-----------------------------------\n")
+
+    return train_combined, val_combined
 
     def __len__(self):
         return len(self.ids)

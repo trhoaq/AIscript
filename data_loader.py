@@ -5,8 +5,9 @@ import cv2 # pyright: ignore[reportMissingImports]
 # --- Augmentation Pipelines ---
 
 def get_base_transforms(img_size=256):
-    """Transforms for the base dataset, after initial dynamic padding."""
+    """Transforms for the base dataset, applying fixed padding then resizing."""
     return A.Compose([
+        A.PadIfNeeded(min_height=1000, min_width=1000, border_mode=cv2.BORDER_CONSTANT, fill_value=0, p=1.0),
         A.Resize(height=img_size, width=img_size, p=1.0), # Resize padded square image to img_size x img_size
     ], bbox_params=A.BboxParams(format="pascal_voc", label_fields=["class_labels"]))
 

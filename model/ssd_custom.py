@@ -134,8 +134,14 @@ class SSDMobile(nn.Module):
         boxes[:, 2:] = torch.exp(loc[:, 2:] * self.variances[1]) * pr_c[:, 2:]
         return _cxcywh_to_xyxy(boxes)
 
-    def multibox_loss(self, cls_logits: torch.Tensor, box_reg: torch.Tensor, targets, priors: torch.Tensor) -> dict:
+    def multibox_loss(self, cls_logits: torch.Tensor, box_reg: torch.Tensor, targets: List[dict[str, torch.Tensor]], priors: torch.Tensor) -> dict:
         device = cls_logits.device
+        
+        # Defensive device placement for all inputs
+        box_reg = box_reg.to(device)
+        priors = priors.to(device)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
         batch_size = cls_logits.size(0)
 
         loc_loss = 0.0
