@@ -1,10 +1,16 @@
 {
-  "data_root": "../DatasetVoc/f",
-  "img_size": 512,
+  "voc_root": "./data",
+  "voc_years": ["2007", "2012"],
+  "img_size": 320,
   "batch_size": 4,
-  "num_classes": 4,
-  "box_classes": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14"],
-  "obj_classes": ["f", "h", "s"],
+  "num_classes": 21,
+  "obj_classes": [
+    "background",
+    "aeroplane", "bicycle", "bird", "boat", "bottle", 
+    "bus", "car", "cat", "chair", "cow", 
+    "diningtable", "dog", "horse", "motorbike", "person", 
+    "pottedplant", "sheep", "sofa", "train", "tvmonitor"
+  ],
   "lr": 0.0001,
   "weight_decay": 0.0001,
   "epochs": 20,
@@ -16,5 +22,9 @@
   "s_max": 0.95,
   "log_file": "log.txt",
   "ckpt_best": "best.pth",
-  "ckpt_final": "final.pth"
+  "ckpt_final": "final.pth",
+  "p_mosaic": 0.5,
+  "p_mixup": 0.5,
+  "num_workers": 4,
+  "early_stopping_patience": 10
 }

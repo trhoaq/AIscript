@@ -1,124 +1,148 @@
 import os
-import shutil
-import tarfile
-import requests
-from tqdm import tqdm
-from data_loader import PascalVOCDataset, get_train_transforms, get_eval_transforms # Assuming PascalVOCDataset is in data_loader.py
+import cv2
+import xml.etree.ElementTree as ET
+import json
+import torch
+from torch.utils.data import Dataset, ConcatDataset
 
-# Base URL for VOC datasets
-VOC_URLS = {
-    '2012_trainval': 'http://host.robots.ox.ac.uk/pascal/VOC/voc2012/VOCdevkit_18-May-2012.tar',
-}
+# --- Configuration & Mapping ---
+try:
+    with open("config.json", "r", encoding="utf-8") as f:
+        CFG = json.load(f)
+    OBJ_CLASSES = CFG["obj_classes"]
+except Exception:
+    OBJ_CLASSES = ["background", "target"] # Fallback
 
-def download_file(url, path):
-    """Downloads a file from a URL to a given path."""
-    response = requests.get(url, stream=True)
-    response.raise_for_status()
-    total_size = int(response.headers.get('content-length', 0))
-    block_size = 1024 # 1 KB
-    t = tqdm(total=total_size, unit='iB', unit_scale=True, desc=url.split('/')[-1])
-    with open(path, 'wb') as f:
-        for chunk in response.iter_content(block_size):
-            t.update(len(chunk))
-            f.write(chunk)
-    t.close()
+class_to_idx = {cls: i for i, cls in enumerate(OBJ_CLASSES)}
 
-def extract_tar(file_path, dest_dir):
-    """Extracts a tar file to a destination directory."""
-    with tarfile.open(file_path, 'r') as tar:
-        tar.extractall(dest_dir)
-
-def prepare_voc_dataset(year='2012', root_dir='./data/VOC', download=True):
+class PascalVOCDataset(Dataset):
     """
-    Prepares the Pascal VOC dataset (downloads and extracts if necessary).
-    
-    Args:
-        year (str): The VOC year, e.g., '2012', '2007'.
-        root_dir (str): The root directory where VOCdevkit will be stored.
-        download (bool): Whether to download the dataset if not found.
+    Base dataset for loading images and annotations from Pascal VOC format.
+    Does not apply complex augmentations, only loads the data.
     """
-    voc_devkit_dir = os.path.join(root_dir, f'VOCdevkit/VOC{year}')
-    
-    if os.path.exists(voc_devkit_dir):
-        print(f"VOC{year} dataset already exists at {voc_devkit_dir}. Skipping download.")
-        return
+    def __init__(self, root, image_set='default', mode='RGB', transform=None):
+        self.root = root
+        self.mode = mode
+        self.transform = transform
+        
+        # Try 'JPEGImages' first (standard VOC), then 'Images'
+        if os.path.exists(os.path.join(root, 'JPEGImages')):
+            self.images_path = os.path.join(root, 'JPEGImages')
+        else:
+            self.images_path = os.path.join(root, 'Images')
+            
+        self.anno_path = os.path.join(root, 'Annotations')
+        
+        set_file = os.path.join(root, 'ImageSets/Main', f'{image_set}.txt')
+        
+        self.ids = []
+        if os.path.exists(set_file):
+            with open(set_file, 'r', encoding='utf-8-sig') as f:
+                valid_ids = [line.strip() for line in f if line.strip()]
+            
+            for img_id in valid_ids:
+                img_path = os.path.join(self.images_path, f'{img_id}.jpg')
+                ann_path = os.path.join(self.anno_path, f'{img_id}.xml')
+                if os.path.exists(img_path) and os.path.exists(ann_path):
+                    self.ids.append(img_id)
+        
+        print(f"Found {len(self.ids)} valid samples in {image_set} set (Root: {root}).")
 
-    if not download:
-        raise FileNotFoundError(f"VOC{year} dataset not found at {voc_devkit_dir}. Set download=True to download.")
+    def __getitem__(self, index):
+        img_id = self.ids[index]
+        img_path = os.path.join(self.images_path, f'{img_id}.jpg')
+        ann_path = os.path.join(self.anno_path, f'{img_id}.xml')
 
-    os.makedirs(root_dir, exist_ok=True)
+        img = cv2.imread(img_path)
+        if img is None: return None, None
+        if self.mode == 'RGB': img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        tree = ET.parse(ann_path)
+        boxes, labels = [], []
+        for obj in tree.getroot().findall('object'):
+            name = obj.find('name').text.strip()
+            if name in class_to_idx:
+                bbox = obj.find('bndbox')
+                xmin = float(bbox.find('xmin').text)
+                ymin = float(bbox.find('ymin').text)
+                xmax = float(bbox.find('xmax').text)
+                ymax = float(bbox.find('ymax').text)
+                if xmax > xmin and ymax > ymin:
+                    boxes.append([xmin, ymin, xmax, ymax])
+                    labels.append(class_to_idx[name])
+        
+        if not boxes: return None, None
 
-    # Handle VOC2012 train/val
-    if year == '2012':
-        tar_url = VOC_URLS['2012_trainval']
-        tar_path = os.path.join(root_dir, 'VOCdevkit_2012.tar')
-        print(f"Downloading VOC2012 train/val from {tar_url}...")
-        download_file(tar_url, tar_path)
-        print(f"Extracting {tar_path}...")
-        extract_tar(tar_path, root_dir)
-        os.remove(tar_path)
-        print("VOC2012 train/val prepared.")
-    else:
-        raise ValueError(f"Unsupported VOC year: {year}. Only '2012' is supported.")
+        target = {"boxes": boxes, "labels": labels}
 
-def get_voc_datasets(voc_root='./data/VOC', img_size=256, years=['2012'], transform_train=None, transform_val=None):
+        # --- Dynamic Padding to Square Based on Max Dimension ---
+        h, w, _ = img.shape
+        max_dim = max(h, w)
+        
+        # Apply padding only if necessary (i.e., not already a square)
+        if h != w:
+            temp_pad_transform = A.PadIfNeeded(min_height=max_dim, min_width=max_dim, 
+                                               border_mode=cv2.BORDER_CONSTANT, fill_value=0, p=1.0, 
+                                               bbox_params=A.BboxParams(format="pascal_voc", label_fields=["class_labels"]))
+            
+            padded_result = temp_pad_transform(image=img, bboxes=target["boxes"], class_labels=target["labels"])
+            img = padded_result['image']
+            target['boxes'] = padded_result['bboxes']
+            target['labels'] = padded_result['class_labels']
+        # --- End Dynamic Padding ---
+        
+        if self.transform:
+            transformed = self.transform(image=img, bboxes=target["boxes"], class_labels=target["labels"])
+            img = transformed['image']
+            target['boxes'] = transformed['bboxes']
+            target['labels'] = transformed['class_labels']
+
+        return img, target
+
+    def __len__(self):
+        return len(self.ids)
+
+def get_voc_datasets(voc_root, img_size, years, transform_train=None, transform_val=None):
     """
-    Gets Pascal VOC datasets for specified years, combining train/val sets as needed.
-    
-    Args:
-        voc_root (str): Root directory for VOC datasets.
-        img_size (int): Image size for transformations.
-        years (list): List of VOC years to use (e.g., ['2012', '2007']).
-        transform_train: Training transformations. Defaults to get_train_transforms(img_size).
-        transform_val: Validation transformations. Defaults to get_eval_transforms(img_size).
-    
-    Returns:
-        tuple: (train_dataset, val_dataset)
+    Helper function to get combined train and validation datasets for VOC.
     """
-    if transform_train is None:
-        transform_train = get_train_transforms(img_size)
-    if transform_val is None:
-        transform_val = get_eval_transforms(img_size)
-
     train_datasets = []
     val_datasets = []
-
+    
+    # Check if root contains years directly
+    # Original train.py defaults: voc_years=["2012"], voc_root="./data/VOC"
     for year in years:
-        print(f"Preparing VOC{year}...")
-        prepare_voc_dataset(year, voc_root)
+        # Check standard VOC structure: root/VOC2012/Images etc.
+        year_path = os.path.join(voc_root, f"VOC{year}")
+        if not os.path.exists(year_path):
+            # Try root/2012 if VOC prefix missing
+            year_path = os.path.join(voc_root, year)
+            if not os.path.exists(year_path):
+                print(f"Warning: VOC {year} folder not found in {voc_root}")
+                continue
         
-        # PascalVOCDataset expects the root to be VOCdevkit/VOC{year}
-        dataset_base_path = os.path.join(voc_root, f'VOCdevkit/VOC{year}')
+        train_ds = PascalVOCDataset(year_path, image_set='trainval', transform=transform_train)
+        val_ds = PascalVOCDataset(year_path, image_set='val', transform=transform_val)
         
-        # VOC2012 only has train/val split
-        if year == '2012':
-            train_datasets.append(PascalVOCDataset(root=dataset_base_path, image_set='train', transform=transform_train))
-            val_datasets.append(PascalVOCDataset(root=dataset_base_path, image_set='val', transform=transform_val))
+        train_datasets.append(train_ds)
+        val_datasets.append(val_ds)
+    
+    if not train_datasets:
+        # Fallback: maybe voc_root IS the dataset folder
+        print(f"No year-specific folders found, trying {voc_root} directly...")
+        train_ds = PascalVOCDataset(voc_root, image_set='trainval', transform=transform_train)
+        val_ds = PascalVOCDataset(voc_root, image_set='val', transform=transform_val)
+        if len(train_ds) > 0:
+            print(f"Total: {len(train_ds)} train samples, {len(val_ds)} val samples.")
+            return train_ds, val_ds
         else:
-            raise ValueError(f"Unsupported VOC year: {year}. Only '2012' is supported in get_voc_datasets.")
-    
-    # Concatenate datasets if multiple years are specified
-    final_train_dataset = torch.utils.data.ConcatDataset(train_datasets) if len(train_datasets) > 1 else (train_datasets[0] if train_datasets else None)
-    final_val_dataset = torch.utils.data.ConcatDataset(val_datasets) if len(val_datasets) > 1 else (val_datasets[0] if val_datasets else None)
+            raise FileNotFoundError(f"No VOC samples found in {voc_root}")
 
-    return final_train_dataset, final_val_dataset
+    train_combined = ConcatDataset(train_datasets)
+    val_combined = ConcatDataset(val_datasets)
+    print(f"\n--- Combined Dataset Statistics ---")
+    print(f"Total Combined Train samples: {len(train_combined)}")
+    print(f"Total Combined Val samples: {len(val_combined)}")
+    print(f"-----------------------------------\n")
 
-if __name__ == '__main__':
-    # Example usage:
-    # This will download and prepare VOC2012 and VOC2007,
-    # then create combined train/val datasets.
-    train_ds, val_ds = get_voc_datasets(years=['2012', '2007'])
-    
-    if train_ds:
-        print(f"Combined Train Dataset size: {len(train_ds)}")
-    if val_ds:
-        print(f"Combined Val Dataset size: {len(val_ds)}")
-
-    # You can then use these datasets with DataLoader
-    # from torch.utils.data import DataLoader
-    # train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=2)
-    # val_loader = DataLoader(val_ds, batch_size=4, shuffle=False, num_workers=2)
-    
-    # for i, (images, targets) in enumerate(train_loader):
-    #     print(f"Batch {i}: images shape {images.shape}, targets len {len(targets)}")
-    #     break
+    return train_combined, val_combined

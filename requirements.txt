@@ -1,8 +1,11 @@
 torch>=1.9.0
 torchvision>=0.10.0
+torchmetrics[detection]
 albumentations>=1.0.0
 opencv-python>=4.5.0
 tqdm>=4.0.0
 requests>=2.0.0
 numpy>=1.20.0
-timm>=0.4.12 # Optional, for pre-trained GhostNet/MobileNetV3
+timm>=0.4.12 
+thop
+

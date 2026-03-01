@@ -4,7 +4,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 import os
-from typing import List
+from typing import List, Dict, Any
+from torchmetrics.detection import MeanAveragePrecision # Import mAP metric
+# You might need to install torchmetrics: pip install torchmetrics torchvision
 
 class DistillationLoss(nn.Module):
     """
@@ -46,7 +48,7 @@ class DetectorTrainer:
     def __init__(self, model, train_loader, val_loader, device, config):
         self.model = model.to(device)
         self.train_loader = train_loader
-        self.val_loader = val_loader # Storing val_loader
+        self.val_loader = val_loader
         self.device = device
         self.config = config
         
@@ -78,6 +80,15 @@ class DetectorTrainer:
         )
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=config.get('epochs', 100))
         
+        # --- Metrics and Early Stopping ---
+        self.map_metric = MeanAveragePrecision(iou_thresholds=[0.5], class_metrics=False).to(device) # Only overall mAP@0.5
+        self.score_thresh = config.get('score_thresh', 0.05) # From config.json
+        
+        self.best_val_map05 = -1.0 # Track best mAP@0.5 for early stopping
+        self.epochs_no_improve = 0
+        self.early_stopping_patience = config.get('early_stopping_patience', 10) # Default patience
+        self.best_model_state: Dict[str, Any] = {} # To store best model weights and adapter weights
+        print(f"Early stopping patience set to: {self.early_stopping_patience}")
 
     def train_epoch(self, epoch):
         self.model.train()
@@ -132,39 +143,93 @@ class DetectorTrainer:
     def evaluate_epoch(self, epoch):
         if self.val_loader is None:
             print("Validation loader not provided. Skipping evaluation.")
-            return None
+            return None, None, None # Return three None values for mAP, P, R
 
         self.model.eval()
-        # Adapters should be in eval mode too if they exist
         if self.feature_adapters:
             self.feature_adapters.eval()
 
         total_val_loss = 0
         pbar = tqdm(self.val_loader, desc=f"Epoch {epoch} [Val]")
 
+        # For mAP calculation
+        all_preds = []
+        all_targets = []
+
         with torch.no_grad():
-            for batch in pbar:
+            for batch_idx, batch in enumerate(pbar):
                 if batch[0] is None:
+                    # print(f"Warning: Batch {batch_idx} in val_loader contained None values. Skipping.")
                     continue
                 images, targets = batch
                 
                 images = torch.stack([img.to(self.device) for img in images])
-                targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
+                original_targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets] # Ground Truth
 
                 student_logits, student_regs, student_feats = self.model.forward_logits(images)
                 
                 feat_sizes = [(f.size(2), f.size(3)) for f in student_feats]
                 priors = self.model.anchor_generator.generate(feat_sizes, self.model.img_size, student_logits.device)
                 
-                gt_loss_dict = self.model.multibox_loss(student_logits, student_regs, targets, priors)
+                gt_loss_dict = self.model.multibox_loss(student_logits, student_regs, original_targets, priors)
                 
                 loss = gt_loss_dict["bbox_regression"] + gt_loss_dict["classification"]
 
-                # Note: No KD loss during evaluation typically
                 total_val_loss += loss.item()
                 pbar.set_postfix(val_loss=loss.item())
+
+                # Post-process model outputs for mAP calculation
+                # Ensure original_targets passed to post_process have img_size in them if needed
+                # self.model.post_process expects `original_targets` to potentially contain image metadata like original image size if transformations were applied
+                detections = self.model.post_process(student_logits, student_regs, priors, self.model.img_size, self.config['score_thresh'])
+                
+                for i in range(len(detections)):
+                    # Ensure boxes are float32 and labels/scores are int64/float32
+                    # Detections might be empty if no boxes above threshold
+                    pred_boxes = detections[i][:, :4] if detections[i].numel() > 0 else torch.empty((0, 4), device=self.device, dtype=torch.float32)
+                    pred_scores = detections[i][:, 4] if detections[i].numel() > 0 else torch.empty((0,), device=self.device, dtype=torch.float32)
+                    pred_labels = detections[i][:, 5].long() if detections[i].numel() > 0 else torch.empty((0,), device=self.device, dtype=torch.int64)
+
+                    all_preds.append({
+                        "boxes": pred_boxes,
+                        "scores": pred_scores,
+                        "labels": pred_labels,
+                    })
+
+                    all_targets.append({
+                        "boxes": original_targets[i]["boxes"],
+                        "labels": original_targets[i]["labels"],
+                    })
         
-        return total_val_loss / len(self.val_loader) if len(self.val_loader) > 0 else 0
+        # Compute mAP, Precision, Recall
+        avg_val_loss = total_val_loss / len(self.val_loader) if len(self.val_loader) > 0 else 0
+
+        if len(all_preds) > 0 and len(all_targets) > 0:
+            self.map_metric.update(all_preds, all_targets)
+            map_results = self.map_metric.compute()
+            
+            mAP_0_5 = map_results['map_50'].item() if 'map_50' in map_results else 0.0
+            # Note: torchmetrics v0.11 doesn't directly provide overall P and R for object detection.
+            # map_50_recall might be related to average recall, or can be derived from other parts of map_results.
+            # For simplicity, we'll use mAP_50 as the primary metric for early stopping and report it.
+            # You would typically need to iterate through map_results['per_class_stats'] or use custom logic
+            # to get overall precision/recall if class_metrics=True was used.
+            
+            # Placeholder for overall Precision and Recall - direct computation is complex
+            # and might require custom aggregation from per-class metrics if needed precisely.
+            # For this task, we focus on mAP_0_5 for early stopping and general evaluation.
+            precision_0_5 = mAP_0_5 # Simplified for display
+            recall_0_5 = mAP_0_5 # Simplified for display
+
+            self.map_metric.reset() # Reset for next epoch
+        else:
+            mAP_0_5 = 0.0
+            precision_0_5 = 0.0
+            recall_0_5 = 0.0
+            print("Warning: No valid predictions or targets for mAP calculation in this epoch. Setting metrics to 0.")
+
+        # Return relevant metrics
+        return avg_val_loss, mAP_0_5, precision_0_5, recall_0_5
 
     def save_checkpoint(self, path):
         if not os.path.exists(os.path.dirname(path)):

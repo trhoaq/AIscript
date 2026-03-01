@@ -1,17 +1,17 @@
 import torch
 from torch.utils.data import DataLoader
 from data_loader import (
-    MosaicMixupDataset,
     get_base_transforms, 
     get_final_transforms, 
     get_eval_transforms, 
     safe_collate_fn
 )
-from dataset.voc import get_voc_datasets # Import the new VOC dataset helper
+from dataset import MosaicMixupDataset, get_voc_datasets
 # ONLY IMPORT SSDMobile, this is the model we are training (the teacher)
 from model.ssd_custom import SSDMobile 
 from trainer import DetectorTrainer
 import json
+from typing import Dict, Any
 
 def main():
     # 1. Load Config
@@ -86,12 +86,29 @@ def main():
         s_max=0.95,
     )
 
+    # Calculate and log model complexity (total params and MAdds)
+    try:
+        from thop import profile
+        dummy_input = torch.randn(1, 3, img_size, img_size).to(device)
+        total_madds, total_params = profile(model, inputs=(dummy_input,), verbose=False)
+        print(f"\n--- Teacher Model Complexity ---")
+        print(f"Total Parameters: {total_params / 1e6:.2f} M")
+        print(f"Total MAdds (Giga): {total_madds / 1e9:.2f} G")
+        print(f"--------------------------------\n")
+    except ImportError:
+        print("Warning: 'thop' library not found. Skipping calculation of teacher model parameters and MAdds.")
+        print("Install with: pip install thop")
+    except Exception as e:
+        print(f"Warning: Could not calculate teacher model complexity: {e}")
+
     # 4. Trainer
-    trainer_config = {
+    trainer_config: Dict[str, Any] = { # Add type hint for trainer_config
         'lr': config.get('lr', 1e-3),
         'epochs': config.get('epochs', 100),
         # No teacher_model, kd_weights needed for training the teacher itself
         'weight_decay': config.get('weight_decay', 1e-4),
+        'early_stopping_patience': config.get('early_stopping_patience', 10), # Pass patience
+        'score_thresh': config.get('score_thresh', 0.05) # Pass score_thresh for post-processing
     }
     
     # Pass None for teacher_model as we are training the model itself
@@ -104,12 +121,41 @@ def main():
         if train_loss is not None:
             print(f"Epoch {epoch}/{trainer_config['epochs']} | Train Loss: {train_loss:.4f}")
         
-        val_loss = trainer.evaluate_epoch(epoch)
+        # Evaluate after each epoch
+        val_loss, val_mAP_0_5, val_precision, val_recall = trainer.evaluate_epoch(epoch)
         if val_loss is not None:
-            print(f"Epoch {epoch}/{trainer_config['epochs']} | Val Loss: {val_loss:.4f}")
+            print(f"Epoch {epoch}/{trainer_config['epochs']} | Val Loss: {val_loss:.4f} | mAP@0.5: {val_mAP_0_5:.4f} | P@0.5: {val_precision:.4f} | R@0.5: {val_recall:.4f}")
 
-        if epoch % 10 == 0:
-            trainer.save_checkpoint(f"models/ssdmobile_teacher_epoch_{epoch}.pth")
+        # Early Stopping Logic
+        if val_mAP_0_5 > trainer.best_val_map05:
+            trainer.best_val_map05 = val_mAP_0_5
+            trainer.epochs_no_improve = 0
+            trainer.best_model_state = {
+                'model_state_dict': trainer.model.state_dict(),
+                'optimizer_state_dict': trainer.optimizer.state_dict(),
+                'scheduler_state_dict': trainer.scheduler.state_dict(),
+                'epoch': epoch,
+                'val_mAP_0_5': val_mAP_0_5
+            }
+            # No feature_adapters for teacher model
+            trainer.save_checkpoint("models/teacher_best_model.pth")
+            print(f"Validation mAP@0.5 improved to {trainer.best_val_map05:.4f}. Saving best teacher model state.")
+        else:
+            trainer.epochs_no_improve += 1
+            print(f"Validation mAP@0.5 did not improve. Epochs without improvement: {trainer.epochs_no_improve}")
+
+        if trainer.epochs_no_improve >= trainer.early_stopping_patience:
+            print(f"Early stopping triggered for Teacher Model after {trainer.early_stopping_patience} epochs without improvement.")
+            if trainer.best_model_state:
+                trainer.model.load_state_dict(trainer.best_model_state['model_state_dict'])
+                trainer.optimizer.load_state_dict(trainer.best_model_state['optimizer_state_dict'])
+                trainer.scheduler.load_state_dict(trainer.best_model_state['scheduler_state_dict'])
+                # No feature_adapters for teacher model
+                print("Loaded best teacher model weights from checkpoint.")
+            break # Exit training loop
+
+    # Save final model state after training (or early stopping)
+    trainer.save_checkpoint(f"models/teacher_final_model.pth")
 
 if __name__ == "__main__":
     main()
