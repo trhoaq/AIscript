@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torchvision.ops import box_iou, nms
 from model.ghostnet import GhostNet, _make_divisible
 from model.utils import DefaultBoxGenerator, _xyxy_to_cxcywh, _cxcywh_to_xyxy
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # --- Model Components ---
 
@@ -216,8 +216,23 @@ class SSDGhost(nn.Module):
         total_pos = max(1, total_pos)
         return {"bbox_regression": loc_loss / total_pos, "classification": cls_loss / total_pos}
 
-    def post_process(self, cls_p, reg_p, priors, img_size=None, score_thresh=None):
-        if score_thresh is None: score_thresh = self.score_thresh
+    def post_process(
+        self,
+        cls_p,
+        reg_p,
+        priors,
+        img_size=None,
+        score_thresh=None,
+        pre_nms_topk: Optional[int] = None,
+        max_detections: Optional[int] = None,
+    ):
+        if score_thresh is None:
+            score_thresh = self.score_thresh
+        if pre_nms_topk is None:
+            pre_nms_topk = 400
+        if max_detections is None:
+            max_detections = 100
+
         probs = F.softmax(cls_p, dim=-1)
         results = []
         for b in range(cls_p.size(0)):
@@ -227,10 +242,19 @@ class SSDGhost(nn.Module):
             for c in range(1, self.num_classes):
                 c_scores = scores[:, c]
                 keep = c_scores > score_thresh
-                if keep.sum() == 0: continue
+                if keep.sum() == 0:
+                    continue
                 c_boxes, c_scores = boxes[keep], c_scores[keep]
+
+                # Cap the candidate set per class to keep NMS tractable.
+                if pre_nms_topk > 0 and c_scores.numel() > pre_nms_topk:
+                    topk_idx = torch.topk(c_scores, k=pre_nms_topk).indices
+                    c_boxes = c_boxes[topk_idx]
+                    c_scores = c_scores[topk_idx]
+
                 keep_idx = nms(c_boxes, c_scores, self.nms_thresh)
-                out_boxes.append(c_boxes[keep_idx]); out_scores.append(c_scores[keep_idx])
+                out_boxes.append(c_boxes[keep_idx])
+                out_scores.append(c_scores[keep_idx])
                 out_labels.append(torch.full((keep_idx.numel(),), c, device=cls_p.device, dtype=torch.long))
             
             if out_boxes:
@@ -239,7 +263,14 @@ class SSDGhost(nn.Module):
                 boxes_cat = torch.cat(out_boxes)
                 scores_cat = torch.cat(out_scores).unsqueeze(1)
                 labels_cat = torch.cat(out_labels).unsqueeze(1).float()
-                results.append(torch.cat([boxes_cat, scores_cat, labels_cat], dim=1))
+                preds = torch.cat([boxes_cat, scores_cat, labels_cat], dim=1)
+
+                # Keep only global top-scoring detections per image.
+                if max_detections > 0 and preds.size(0) > max_detections:
+                    top_idx = torch.topk(preds[:, 4], k=max_detections).indices
+                    preds = preds[top_idx]
+
+                results.append(preds)
             else:
                 results.append(torch.zeros((0, 6), device=cls_p.device))
         return results

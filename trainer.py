@@ -99,6 +99,9 @@ class DetectorTrainer:
         
         # --- Metrics and Early Stopping ---
         self.score_thresh = config.get('score_thresh', 0.05) # From config.json
+        self.eval_score_thresh = config.get('eval_score_thresh', self.score_thresh)
+        self.eval_pre_nms_topk = config.get('eval_pre_nms_topk', 400)
+        self.eval_max_detections = config.get('eval_max_detections', 100)
         
         self.best_val_map05 = -1.0 # Track best mAP@0.5 for early stopping
         self.epochs_no_improve = 0
@@ -206,7 +209,15 @@ class DetectorTrainer:
                 pbar.set_postfix(val_loss=loss.item())
 
                 # Post-process model outputs for mAP calculation
-                detections = self.model.post_process(student_logits, student_regs, priors, self.model.img_size, self.config['score_thresh'])
+                detections = self.model.post_process(
+                    student_logits,
+                    student_regs,
+                    priors,
+                    self.model.img_size,
+                    self.eval_score_thresh,
+                    pre_nms_topk=self.eval_pre_nms_topk,
+                    max_detections=self.eval_max_detections,
+                )
                 
                 for i in range(len(detections)):
                     # Keep on original device (GPU) to use GPU acceleration for IoU later

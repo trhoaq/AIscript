@@ -1,4 +1,5 @@
 import torch
+import os
 from torch.utils.data import DataLoader
 from data_loader import (
     get_base_transforms, 
@@ -37,6 +38,7 @@ def main():
     num_workers = config.get("num_workers", 4)
     voc_years = config.get("voc_years", ["2012"])
     voc_root = config.get("voc_root", "./data/VOC")
+    eval_interval = max(1, int(config.get("eval_interval", 1)))
 
     # 2. Dataset & Loader
     # Get combined train and validation datasets using the new helper
@@ -80,14 +82,17 @@ def main():
 
     # Calculate and log model complexity (total params and MAdds)
     try:
-        from thop import profile, utils # Import utils
+        import copy
+        from thop import profile
+        # Create a dummy copy to avoid polluting the main model with hooks
+        model_copy = copy.deepcopy(model).to(device)
         dummy_input = torch.randn(1, 3, img_size, img_size).to(device)
-        total_madds, total_params = profile(model, inputs=(dummy_input,), verbose=False)
+        total_madds, total_params = profile(model_copy, inputs=(dummy_input,), verbose=False)
         print(f"\n--- Model Complexity ---")
         print(f"Total Parameters: {total_params / 1e6:.2f} M")
         print(f"Total MAdds (Giga): {total_madds / 1e9:.2f} G")
         print(f"------------------------\n")
-        utils.remove_hooks(model) # Explicitly remove hooks after profiling
+        del model_copy # Cleanup
     except ImportError:
         print("Warning: 'thop' library not found. Skipping calculation of model parameters and MAdds.")
         print("Install with: pip install thop")
@@ -116,7 +121,10 @@ def main():
         'kd_feature_weight': config.get('kd_feature_weight', 1.0),
         'kd_logit_weight': config.get('kd_logit_weight', 1.0),
         'early_stopping_patience': config.get('early_stopping_patience', 10), # Pass patience
-        'score_thresh': config.get('score_thresh', 0.05) # Pass score_thresh for post-processing
+        'score_thresh': config.get('score_thresh', 0.05), # Pass score_thresh for post-processing
+        'eval_score_thresh': config.get('eval_score_thresh', config.get('score_thresh', 0.05)),
+        'eval_pre_nms_topk': config.get('eval_pre_nms_topk', 400),
+        'eval_max_detections': config.get('eval_max_detections', 100),
     }
     
     trainer = DetectorTrainer(model, train_loader, val_loader, device, trainer_config)
@@ -134,29 +142,33 @@ def main():
         if train_loss is not None:
             print(f"Epoch {epoch}/{trainer_config['epochs']} | Train Loss: {train_loss:.4f}")
         
-        # Evaluate after each epoch
-        val_loss, val_mAP_0_5, val_precision, val_recall = trainer.evaluate_epoch(epoch)
-        if val_loss is not None:
-            print(f"Epoch {epoch}/{trainer_config['epochs']} | Val Loss: {val_loss:.4f} | mAP@0.5: {val_mAP_0_5:.4f} | P@0.5: {val_precision:.4f} | R@0.5: {val_recall:.4f}")
+        # Evaluate based on configured interval to avoid expensive validation every epoch.
+        should_eval = (epoch % eval_interval == 0)
+        if should_eval:
+            val_loss, val_mAP_0_5, val_precision, val_recall = trainer.evaluate_epoch(epoch)
+            if val_loss is not None:
+                print(f"Epoch {epoch}/{trainer_config['epochs']} | Val Loss: {val_loss:.4f} | mAP@0.5: {val_mAP_0_5:.4f} | P@0.5: {val_precision:.4f} | R@0.5: {val_recall:.4f}")
 
-        # Early Stopping Logic
-        if val_mAP_0_5 > trainer.best_val_map05:
-            trainer.best_val_map05 = val_mAP_0_5
-            trainer.epochs_no_improve = 0
-            trainer.best_model_state = {
-                'model_state_dict': trainer.model.state_dict(),
-                'optimizer_state_dict': trainer.optimizer.state_dict(),
-                'scheduler_state_dict': trainer.scheduler.state_dict(),
-                'epoch': epoch,
-                'val_mAP_0_5': val_mAP_0_5
-            }
-            if trainer.feature_adapters:
-                trainer.best_model_state['adapters_state_dict'] = trainer.feature_adapters.state_dict()
-            trainer.save_checkpoint("models/best_model.pth")
-            print(f"Validation mAP@0.5 improved to {trainer.best_val_map05:.4f}. Saving best model state.")
+            # Early Stopping Logic (only update when an eval is run)
+            if val_mAP_0_5 > trainer.best_val_map05:
+                trainer.best_val_map05 = val_mAP_0_5
+                trainer.epochs_no_improve = 0
+                trainer.best_model_state = {
+                    'model_state_dict': trainer.model.state_dict(),
+                    'optimizer_state_dict': trainer.optimizer.state_dict(),
+                    'scheduler_state_dict': trainer.scheduler.state_dict(),
+                    'epoch': epoch,
+                    'val_mAP_0_5': val_mAP_0_5
+                }
+                if trainer.feature_adapters:
+                    trainer.best_model_state['adapters_state_dict'] = trainer.feature_adapters.state_dict()
+                trainer.save_checkpoint("models/best_model.pth")
+                print(f"Validation mAP@0.5 improved to {trainer.best_val_map05:.4f}. Saving best model state.")
+            else:
+                trainer.epochs_no_improve += 1
+                print(f"Validation mAP@0.5 did not improve. Epochs without improvement: {trainer.epochs_no_improve}")
         else:
-            trainer.epochs_no_improve += 1
-            print(f"Validation mAP@0.5 did not improve. Epochs without improvement: {trainer.epochs_no_improve}")
+            print(f"Skipping validation at epoch {epoch} (eval_interval={eval_interval}).")
 
         # Periodic checkpoint saving (every 10 epochs)
         if epoch % 10 == 0:

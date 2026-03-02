@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -215,8 +215,23 @@ class SSDMobile(nn.Module):
             "classification": cls_loss / total_pos,
         }
 
-    def post_process(self, cls_logits: torch.Tensor, box_reg: torch.Tensor, priors: torch.Tensor, img_size=None, score_thresh=None):
-        if score_thresh is None: score_thresh = self.score_thresh
+    def post_process(
+        self,
+        cls_logits: torch.Tensor,
+        box_reg: torch.Tensor,
+        priors: torch.Tensor,
+        img_size=None,
+        score_thresh=None,
+        pre_nms_topk: Optional[int] = None,
+        max_detections: Optional[int] = None,
+    ):
+        if score_thresh is None:
+            score_thresh = self.score_thresh
+        if pre_nms_topk is None:
+            pre_nms_topk = 400
+        if max_detections is None:
+            max_detections = 100
+
         device = cls_logits.device
         probs = F.softmax(cls_logits, dim=-1)
         outputs = []
@@ -233,6 +248,13 @@ class SSDMobile(nn.Module):
                     continue
                 boxes_c = boxes[keep]
                 scores_c = cls_scores[keep]
+
+                # Cap the candidate set per class to keep NMS tractable.
+                if pre_nms_topk > 0 and scores_c.numel() > pre_nms_topk:
+                    topk_idx = torch.topk(scores_c, k=pre_nms_topk).indices
+                    boxes_c = boxes_c[topk_idx]
+                    scores_c = scores_c[topk_idx]
+
                 keep_idx = nms(boxes_c, scores_c, self.nms_thresh)
                 out_boxes.append(boxes_c[keep_idx])
                 out_scores.append(scores_c[keep_idx])
@@ -243,7 +265,14 @@ class SSDMobile(nn.Module):
                 boxes_cat = torch.cat(out_boxes, dim=0)
                 scores_cat = torch.cat(out_scores, dim=0).unsqueeze(1)
                 labels_cat = torch.cat(out_labels, dim=0).unsqueeze(1).float()
-                outputs.append(torch.cat([boxes_cat, scores_cat, labels_cat], dim=1))
+                preds = torch.cat([boxes_cat, scores_cat, labels_cat], dim=1)
+
+                # Keep only global top-scoring detections per image.
+                if max_detections > 0 and preds.size(0) > max_detections:
+                    top_idx = torch.topk(preds[:, 4], k=max_detections).indices
+                    preds = preds[top_idx]
+
+                outputs.append(preds)
             else:
                 outputs.append(torch.zeros((0, 6), device=device))
         return outputs
