@@ -7,6 +7,7 @@ import os
 from typing import List, Dict, Any
 from model.ssd_custom import SSDMobile
 from model.utils import calculate_stats, compute_metrics # Import manual metrics
+from wandb_utils import is_wandb_active, log_wandb
 # Removed torchmetrics import
 
 class DistillationLoss(nn.Module):
@@ -45,11 +46,6 @@ class DistillationLoss(nn.Module):
         total_loss = (self.kd_logit_weight * logit_loss) + (self.kd_feature_weight * feat_loss)
         return total_loss
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
-
 class DetectorTrainer:
     def __init__(self, model, train_loader, val_loader, device, config):
         self.device = device
@@ -57,7 +53,7 @@ class DetectorTrainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config
-        self.use_wandb = wandb is not None and wandb.run is not None
+        self.use_wandb = is_wandb_active()
 
         # If the main model is SSDMobile and pretrained_backbone is enabled, load its pretrained weights
         from model.ssd_custom import SSDMobile
@@ -164,7 +160,13 @@ class DetectorTrainer:
             
         avg_loss = total_loss / len(self.train_loader) if len(self.train_loader) > 0 else 0
         if self.use_wandb:
-            wandb.log({"train/loss": avg_loss, "train/lr": self.optimizer.param_groups[0]['lr'], "epoch": epoch})
+            log_wandb(
+                {
+                    "train/loss": avg_loss,
+                    "train/lr": self.optimizer.param_groups[0]["lr"],
+                },
+                step=epoch,
+            )
             
         self.scheduler.step()
         return avg_loss
@@ -172,7 +174,7 @@ class DetectorTrainer:
     def evaluate_epoch(self, epoch):
         if self.val_loader is None:
             print("Validation loader not provided. Skipping evaluation.")
-            return None, None, None # Return three None values for mAP, P, R
+            return None, None, None, None
 
         self.model.eval()
         if self.feature_adapters:
@@ -236,16 +238,20 @@ class DetectorTrainer:
         else:
             mAP_0_5, precision_0_5, recall_0_5 = 0.0, 0.0, 0.0
             print("Warning: No valid predictions or targets for mAP calculation in this epoch. Setting metrics to 0.")
+        f1_0_5 = 2 * precision_0_5 * recall_0_5 / (precision_0_5 + recall_0_5 + 1e-16)
 
         # Return relevant metrics
         if self.use_wandb:
-            wandb.log({
-                "val/loss": avg_val_loss, 
-                "val/mAP@0.5": mAP_0_5, 
-                "val/Precision@0.5": precision_0_5, 
-                "val/Recall@0.5": recall_0_5, 
-                "epoch": epoch
-            })
+            log_wandb(
+                {
+                    "val/loss": avg_val_loss,
+                    "val/mAP@0.5": mAP_0_5,
+                    "val/Precision@0.5": precision_0_5,
+                    "val/Recall@0.5": recall_0_5,
+                    "val/F1@0.5": f1_0_5,
+                },
+                step=epoch,
+            )
 
         # Track interval best
         if mAP_0_5 > self.interval_best_map05:

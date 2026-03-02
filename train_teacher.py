@@ -11,6 +11,7 @@ from dataset import MosaicMixupDataset, get_voc_datasets
 # ONLY IMPORT SSDMobile, this is the model we are training (the teacher)
 from model.ssd_custom import SSDMobile 
 from trainer import DetectorTrainer
+from wandb_utils import finish_wandb, init_wandb, log_wandb
 import json
 from typing import Dict, Any
 
@@ -34,19 +35,7 @@ def main():
             "voc_root": "./data/VOC"
         }
 
-    # Initialize wandb
-    try:
-        import wandb
-        if config.get("wandb_project"):
-            wandb.init(
-                project=config["wandb_project"],
-                name=config.get("wandb_run_name", "Teacher-Training"),
-                config=config
-            )
-    except ImportError:
-        print("Warning: wandb not installed. Skipping wandb initialization.")
-    except Exception as e:
-        print(f"Warning: Failed to initialize wandb: {e}")
+    init_wandb(config, default_run_name="Teacher-Training")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     img_size = config.get("img_size", 256)
@@ -177,8 +166,17 @@ def main():
             else:
                 trainer.epochs_no_improve += 1
                 print(f"Validation mAP@0.5 did not improve. Epochs without improvement: {trainer.epochs_no_improve}")
+
+            log_wandb(
+                {
+                    "val/best_mAP@0.5": trainer.best_val_map05,
+                    "train/epochs_no_improve": trainer.epochs_no_improve,
+                },
+                step=epoch,
+            )
         else:
             print(f"Skipping validation at epoch {epoch} (eval_interval={eval_interval}).")
+            log_wandb({"val/skipped": 1}, step=epoch)
 
         # Periodic checkpoint saving (every 10 epochs)
         if epoch % 10 == 0:
@@ -197,12 +195,7 @@ def main():
     # Save final model state after training (or early stopping)
     trainer.save_checkpoint(f"models/teacher_final_model.pth")
 
-    try:
-        import wandb
-        if wandb.run is not None:
-            wandb.finish()
-    except ImportError:
-        pass
+    finish_wandb()
 
 if __name__ == "__main__":
     main()
