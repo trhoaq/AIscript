@@ -1,39 +1,28 @@
-import torch
-import os
-from torch.utils.data import DataLoader
+import torch # type: ignore
+import os, sys
+from torch.utils.data import DataLoader # type: ignore
+from config_utils import load_merged_config
 from data_loader import (
     get_base_transforms, 
     get_final_transforms, 
     get_eval_transforms, 
     safe_collate_fn
 )
-from dataset import MosaicMixupDataset, get_voc_datasets
+from dataset import MosaicMixupDataset, get_coco_datasets, get_voc_datasets
 # ONLY IMPORT SSDMobile, this is the model we are training (the teacher)
 from model.ssd_custom import SSDMobile 
 from trainer import DetectorTrainer
 from wandb_utils import finish_wandb, init_wandb, log_wandb
-import json
 from typing import Dict, Any
 
 def main():
     # 1. Load Config
     try:
-        with open("config.json", "r") as f:
-            config = json.load(f)
+        config = load_merged_config("config/config.json")
     except FileNotFoundError:
         print("config.json not found, using default settings.")
-        config = {
-            "obj_classes": ["bg", "cat", "dog"], 
-            "lr": 1e-3, 
-            "epochs": 50, 
-            "p_mosaic": 0.5, 
-            "p_mixup": 0.5,
-            "img_size": 256,
-            "batch_size": 32,
-            "num_workers": 4,
-            "voc_years": ["2012"], # Default to VOC2012
-            "voc_root": "./data/VOC"
-        }
+        sys.exit()
+        
 
     init_wandb(config, default_run_name="Teacher-Training")
 
@@ -41,19 +30,38 @@ def main():
     img_size = config.get("img_size", 256)
     batch_size = config.get("batch_size", 32)
     num_workers = config.get("num_workers", 4)
+    dataset_format = str(config.get("dataset_format", "voc")).strip().lower()
     voc_years = config.get("voc_years", ["2012"])
     voc_root = config.get("voc_root", "./data/VOC")
+    coco_root = config.get("coco_root", "./data")
+    coco_train_split = config.get("coco_train_split", config.get("train_split", "train2017"))
+    coco_val_split = config.get("coco_val_split", config.get("val_split", "val2017"))
     eval_interval = max(1, int(config.get("eval_interval", 1)))
 
     # 2. Dataset & Loader
-    # Get combined train and validation datasets using the new helper
-    base_train_ds, base_val_ds = get_voc_datasets(
-        voc_root=voc_root,
-        img_size=img_size,
-        years=voc_years,
-        transform_train=get_base_transforms(img_size), # Base transforms for individual images
-        transform_val=get_eval_transforms(img_size) # Eval transforms for validation
-    )
+    if dataset_format == "voc":
+        base_train_ds, base_val_ds = get_voc_datasets(
+            voc_root=voc_root,
+            img_size=img_size,
+            years=voc_years,
+            transform_train=get_base_transforms(img_size),
+            transform_val=get_eval_transforms(img_size),
+            train_split=config.get("train_split", "trainval"),
+            val_split=config.get("val_split", "val"),
+            obj_classes=config.get("obj_classes"),
+        )
+    elif dataset_format == "coco":
+        base_train_ds, base_val_ds = get_coco_datasets(
+            coco_root=coco_root,
+            img_size=img_size,
+            transform_train=get_base_transforms(img_size),
+            transform_val=get_eval_transforms(img_size),
+            train_split=coco_train_split,
+            val_split=coco_val_split,
+            obj_classes=config.get("obj_classes"),
+        )
+    else:
+        raise ValueError("dataset_format must be either 'voc' or 'coco'.")
 
     # Wrap training dataset with Mosaic and MixUp
     train_ds = MosaicMixupDataset(

@@ -1,33 +1,14 @@
-from typing import List, Optional, Tuple
+from collections import OrderedDict
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import mobilenet_v3_large, MobileNet_V3_Large_Weights
+from torchvision.models.detection import SSDLite320_MobileNet_V3_Large_Weights, ssdlite320_mobilenet_v3_large
+from torchvision.models.detection.image_list import ImageList
 from torchvision.ops import box_iou, nms
-from model.utils import DefaultBoxGenerator, _xyxy_to_cxcywh, _cxcywh_to_xyxy
 
-class SSDHead(nn.Module):
-    def __init__(self, in_channels: List[int], num_anchors: List[int], num_classes: int) -> None:
-        super().__init__()
-        self.num_classes = num_classes
-        self.cls_heads = nn.ModuleList()
-        self.box_heads = nn.ModuleList()
-        for c, a in zip(in_channels, num_anchors):
-            self.cls_heads.append(nn.Conv2d(c, a * num_classes, kernel_size=3, padding=1))
-            self.box_heads.append(nn.Conv2d(c, a * 4, kernel_size=3, padding=1))
-
-    def forward(self, feats: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        cls_out = []
-        box_out = []
-        for x, cls_h, box_h in zip(feats, self.cls_heads, self.box_heads):
-            cls = cls_h(x)
-            box = box_h(x)
-            cls = cls.permute(0, 2, 3, 1).contiguous()
-            box = box.permute(0, 2, 3, 1).contiguous()
-            cls_out.append(cls.view(cls.size(0), -1, self.num_classes))
-            box_out.append(box.view(box.size(0), -1, 4))
-        return torch.cat(cls_out, dim=1), torch.cat(box_out, dim=1)
+from model.utils import _cxcywh_to_xyxy, _xyxy_to_cxcywh
 
 
 class SSDMobile(nn.Module):
@@ -35,12 +16,12 @@ class SSDMobile(nn.Module):
         self,
         num_classes: int,
         aspect_ratios: List[List[float]],
-        img_size: int = 512,
+        img_size: int = 320,
         s_min: float = 0.07,
         s_max: float = 0.95,
         score_thresh: float = 0.05,
         nms_thresh: float = 0.5,
-        pretrained_backbone: bool = True, # New parameter
+        pretrained_backbone: bool = True,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -48,35 +29,25 @@ class SSDMobile(nn.Module):
         self.variances = (0.1, 0.2)
         self.score_thresh = score_thresh
         self.nms_thresh = nms_thresh
-        self.anchor_generator = DefaultBoxGenerator(aspect_ratios, s_min=s_min, s_max=s_max)
 
-        # Initialize backbone without pretrained weights initially
-        # Weights will be loaded manually after the model is moved to the target device, if pretrained_backbone is True
-        backbone = mobilenet_v3_large(weights=None) 
-        
-        # Hard-coded indices for feature extraction from Torchvision's MobileNetV3-Large
-        self.backbone = backbone.features
-        self.feature_indices = [6, 12, 16] # Indices for C3, C4, C5 layers
-        
+        # Keep these fields for API compatibility with existing training scripts.
+        self.aspect_ratios = aspect_ratios
+        self.s_min = s_min
+        self.s_max = s_max
+
         self.pretrained_backbone = pretrained_backbone
         self.backbone_has_weights_loaded = False
-        if self.pretrained_backbone:
-            self._weights_enum = MobileNet_V3_Large_Weights.DEFAULT
+        self._weights_enum = SSDLite320_MobileNet_V3_Large_Weights.DEFAULT if pretrained_backbone else None
 
-        self.fpn_out_channels = 128
-        self.lateral_c3 = nn.Conv2d(40, self.fpn_out_channels, kernel_size=1)
-        self.lateral_c4 = nn.Conv2d(112, self.fpn_out_channels, kernel_size=1)
-        self.lateral_c5 = nn.Conv2d(960, self.fpn_out_channels, kernel_size=1)
-        self.smooth_p3 = nn.Conv2d(self.fpn_out_channels, self.fpn_out_channels, kernel_size=3, padding=1)
-        self.smooth_p4 = nn.Conv2d(self.fpn_out_channels, self.fpn_out_channels, kernel_size=3, padding=1)
-        self.smooth_p5 = nn.Conv2d(self.fpn_out_channels, self.fpn_out_channels, kernel_size=3, padding=1)
-        self.p6 = nn.Conv2d(self.fpn_out_channels, self.fpn_out_channels, kernel_size=3, stride=2, padding=1)
-        self.p7 = nn.Conv2d(self.fpn_out_channels, self.fpn_out_channels, kernel_size=3, stride=2, padding=1)
-        self.p8 = nn.Conv2d(self.fpn_out_channels, self.fpn_out_channels, kernel_size=3, stride=2, padding=1)
-
-        self.feature_channels = [self.fpn_out_channels] * 6
-        self.num_anchors = self.anchor_generator.num_anchors_per_location()
-        self.head = SSDHead(self.feature_channels, self.num_anchors, num_classes)
+        ssdlite_model = ssdlite320_mobilenet_v3_large(
+            weights=None,
+            weights_backbone=None,
+            num_classes=num_classes,
+        )
+        self.backbone = ssdlite_model.backbone
+        self.head = ssdlite_model.head
+        self.anchor_generator = ssdlite_model.anchor_generator
+        self.feature_channels = list(getattr(self.backbone, "out_channels", [672, 480, 512, 256, 256, 128]))
 
     def load_pretrained_weights(self, device: torch.device):
         if not self.pretrained_backbone:
@@ -87,60 +58,49 @@ class SSDMobile(nn.Module):
             print("Pretrained weights already loaded for SSDMobile backbone.")
             return
 
-        print(f"Loading MobileNetV3 pretrained weights to device: {device}")
+        print(f"Loading SSDLite MobileNetV3 backbone weights to device: {device}")
         try:
-            # Download weights on CPU first
-            state_dict = self._weights_enum.get_state_dict(progress=True)
-            self.backbone.load_state_dict(state_dict)
+            source_model = ssdlite320_mobilenet_v3_large(weights=self._weights_enum)
+            missing, unexpected = self.backbone.load_state_dict(source_model.backbone.state_dict(), strict=False)
+            del source_model
+            if missing or unexpected:
+                print(f"SSDLite backbone load: missing={len(missing)} unexpected={len(unexpected)}")
             self.backbone_has_weights_loaded = True
-            print("Successfully loaded MobileNetV3 pretrained weights.")
+            print("Successfully loaded SSDLite MobileNetV3 backbone weights.")
         except Exception as e:
-            print(f"Failed to load MobileNetV3 pretrained weights: {e}")
+            print(f"Failed to load SSDLite MobileNetV3 backbone weights: {e}")
             self.backbone_has_weights_loaded = False
 
     def _features(self, x: torch.Tensor) -> List[torch.Tensor]:
-        features = []
-        c3_idx, c4_idx, c5_idx = self.feature_indices
-        
-        for i, layer in enumerate(self.backbone):
-            x = layer(x)
-            if i == c3_idx:
-                features.append(x)
-            elif i == c4_idx:
-                features.append(x)
-            elif i == c5_idx:
-                features.append(x)
-        
-        if len(features) != 3:
-            raise RuntimeError("Backbone feature extraction failed. Check backbone indices.")
-        
-        c3, c4, c5 = features
+        features = self.backbone(x)
+        if isinstance(features, OrderedDict):
+            return list(features.values())
+        if isinstance(features, dict):
+            return list(features.values())
+        if isinstance(features, (list, tuple)):
+            return list(features)
+        raise TypeError(f"Unexpected backbone output type: {type(features)}")
 
-        p5 = self.lateral_c5(c5)
-        p4 = self.lateral_c4(c4) + F.interpolate(p5, size=c4.shape[-2:], mode="nearest")
-        p3 = self.lateral_c3(c3) + F.interpolate(p4, size=c3.shape[-2:], mode="nearest")
+    def generate_priors(self, feats: List[torch.Tensor], images: torch.Tensor) -> torch.Tensor:
+        image_sizes = [(int(images.shape[-2]), int(images.shape[-1]))] * images.shape[0]
+        image_list = ImageList(images, image_sizes)
+        priors_per_image = self.anchor_generator(image_list, feats)
+        return priors_per_image[0]
 
-        p3 = self.smooth_p3(p3)
-        p4 = self.smooth_p4(p4)
-        p5 = self.smooth_p5(p5)
-
-        p6 = self.p6(p5)
-        p7 = self.p7(F.relu(p6))
-        p8 = self.p8(F.relu(p7))
-
-        return [p3, p4, p5, p6, p7, p8]
-
-    def forward_logits(self, images: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+    def forward_logits(self, images: List[torch.Tensor] | torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         if not isinstance(images, torch.Tensor):
             images = torch.stack(images, dim=0)
         feats = self._features(images)
-        cls_logits, box_reg = self.head(feats)
+        head_outputs = self.head(feats)
+        cls_logits = head_outputs["cls_logits"]
+        box_reg = head_outputs["bbox_regression"]
         return cls_logits, box_reg, feats
 
-    def forward(self, images: List[torch.Tensor], targets=None):
+    def forward(self, images: List[torch.Tensor] | torch.Tensor, targets=None):
+        if not isinstance(images, torch.Tensor):
+            images = torch.stack(images, dim=0)
         cls_logits, box_reg, feats = self.forward_logits(images)
-        feat_sizes = [(f.size(2), f.size(3)) for f in feats]
-        priors = self.anchor_generator.generate(feat_sizes, self.img_size, cls_logits.device)
+        priors = self.generate_priors(feats, images)
         if targets is None:
             return self.post_process(cls_logits, box_reg, priors)
         loss_dict = self.multibox_loss(cls_logits, box_reg, targets, priors)
@@ -161,7 +121,7 @@ class SSDMobile(nn.Module):
         boxes[:, 2:] = torch.exp(loc[:, 2:] * self.variances[1]) * pr_c[:, 2:]
         return _cxcywh_to_xyxy(boxes)
 
-    def multibox_loss(self, cls_logits: torch.Tensor, box_reg: torch.Tensor, targets: List[dict[str, torch.Tensor]], priors: torch.Tensor) -> dict:
+    def multibox_loss(self, cls_logits: torch.Tensor, box_reg: torch.Tensor, targets: List[dict[str, torch.Tensor]], priors: torch.Tensor) -> Dict[str, torch.Tensor]:
         device = cls_logits.device
         
         # Defensive device placement for all inputs

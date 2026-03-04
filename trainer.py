@@ -79,11 +79,15 @@ class DetectorTrainer:
                 kd_feature_weight=config.get('kd_feature_weight', 1.0),
                 kd_logit_weight=config.get('kd_logit_weight', 1.0)
             )
-            # Adapters to match teacher's 128 channels to student's 64 channels
-            # We will match the first 5 feature maps
-            self.feature_adapters = nn.ModuleList([
-                nn.Conv2d(128, 64, kernel_size=1) for _ in range(5)
-            ]).to(device)
+            teacher_feature_channels = getattr(self.teacher_model, "feature_channels", None)
+            if isinstance(teacher_feature_channels, (list, tuple)) and len(teacher_feature_channels) > 0:
+                adapter_channels = [int(ch) for ch in teacher_feature_channels[:5]]
+            else:
+                adapter_channels = [128, 128, 128, 128, 128]
+
+            self.feature_adapters = nn.ModuleList(
+                [nn.Conv2d(in_ch, 64, kernel_size=1) for in_ch in adapter_channels]
+            ).to(device)
             params_to_optimize.extend(self.feature_adapters.parameters())
 
         self.optimizer = optim.AdamW(
@@ -132,8 +136,11 @@ class DetectorTrainer:
             
             student_logits, student_regs, student_feats = self.model.forward_logits(images)
             
-            feat_sizes = [(f.size(2), f.size(3)) for f in student_feats]
-            priors = self.model.anchor_generator.generate(feat_sizes, self.model.img_size, student_logits.device)
+            if hasattr(self.model, "generate_priors"):
+                priors = self.model.generate_priors(student_feats, images)
+            else:
+                feat_sizes = [(f.size(2), f.size(3)) for f in student_feats]
+                priors = self.model.anchor_generator.generate(feat_sizes, self.model.img_size, student_logits.device)
             gt_loss_dict = self.model.multibox_loss(student_logits, student_regs, targets, priors)
             
             # Ground truth loss
@@ -146,10 +153,24 @@ class DetectorTrainer:
                 
                 # Adapt teacher features
                 adapted_teacher_feats = []
-                for i in range(len(student_feats)): # Should be 5
-                    adapted_teacher_feats.append(self.feature_adapters[i](teacher_feats_raw[i]))
+                num_feature_pairs = min(len(student_feats), len(teacher_feats_raw), len(self.feature_adapters))
+                for i in range(num_feature_pairs):
+                    teacher_feature = self.feature_adapters[i](teacher_feats_raw[i])
+                    if teacher_feature.shape[-2:] != student_feats[i].shape[-2:]:
+                        teacher_feature = F.interpolate(
+                            teacher_feature,
+                            size=student_feats[i].shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    adapted_teacher_feats.append(teacher_feature)
 
-                kd_loss = self.distill_criterion(student_logits, teacher_logits, student_feats, adapted_teacher_feats)
+                kd_loss = self.distill_criterion(
+                    student_logits,
+                    teacher_logits,
+                    student_feats[:num_feature_pairs],
+                    adapted_teacher_feats,
+                )
                 loss = loss + kd_loss
             
             loss.backward()
@@ -200,8 +221,11 @@ class DetectorTrainer:
 
                 student_logits, student_regs, student_feats = self.model.forward_logits(images)
                 
-                feat_sizes = [(f.size(2), f.size(3)) for f in student_feats]
-                priors = self.model.anchor_generator.generate(feat_sizes, self.model.img_size, student_logits.device)
+                if hasattr(self.model, "generate_priors"):
+                    priors = self.model.generate_priors(student_feats, images)
+                else:
+                    feat_sizes = [(f.size(2), f.size(3)) for f in student_feats]
+                    priors = self.model.anchor_generator.generate(feat_sizes, self.model.img_size, student_logits.device)
                 
                 gt_loss_dict = self.model.multibox_loss(student_logits, student_regs, original_targets, priors)
                 

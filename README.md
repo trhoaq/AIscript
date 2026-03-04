@@ -31,7 +31,7 @@ This project implements an ultra-light object detection system optimized for res
 ├── trainer.py              # Generic DetectorTrainer for training and evaluation
 ├── train.py                # Main script for training the SSDGhost (student) model with KD
 ├── train_teacher.py        # Script for independently training the SSDMobile (teacher) model
-├── config.json             # Configuration file for training parameters
+├── config/                 # Configuration files (training + dataset-specific)
 ├── requirements.txt        # List of Python dependencies
 └── README.md               # Project README file
 ```
@@ -46,7 +46,7 @@ This project implements an ultra-light object detection system optimized for res
 
 2.  **Create a virtual environment (recommended):**
     ```bash
-    python -m venv venv
+    py -m venv venv
     .\venv\Scripts\activate # On Windows
     source venv/bin/activate # On Linux/macOS
     ```
@@ -56,9 +56,10 @@ This project implements an ultra-light object detection system optimized for res
     pip install -r requirements.txt
     ```
 
-## Configuration (`config.json`)
+## Configuration (`config/config.json` + dataset configs)
 
-Before training, you can configure various parameters in `config.json`. A sample `config.json` might look like this:
+Before training, you can configure training parameters in `config/config.json`.
+Dataset-specific parameters live in `config/coco.json` or `config/voc.json` and are selected via `dataset_format`.
 
 ```json
 {
@@ -93,14 +94,14 @@ Before training, you can configure various parameters in `config.json`. A sample
 
 ### 1. Prepare Dataset
 
-The dataset will be automatically downloaded and prepared the first time you run either `train_teacher.py` or `train.py`. Ensure you have internet access. The files will be stored in the directory specified by `voc_root` in `config.json`.
+The dataset will be automatically downloaded and prepared the first time you run either `train_teacher.py` or `train.py`. Ensure you have internet access. The files will be stored in the directory specified by the dataset config in `config/`.
 
 ### 2. Train Teacher Model (SSDMobile)
 
 It is highly recommended to pre-train the teacher model first to achieve good performance before using it for distillation.
 
 ```bash
-python train_teacher.py
+py train_teacher.py
 ```
 This script will save checkpoints of the trained `SSDMobile` model in the `models/` directory.
 
@@ -111,7 +112,7 @@ After training the teacher, you can train the student model. You will need to lo
 **TODO:** Add functionality to load a teacher checkpoint into `train.py`. Currently, `train.py` instantiates the teacher model from scratch.
 
 ```bash
-python train.py
+py train.py
 ```
 This script will train the `SSDGhost` model, guided by the `SSDMobile` teacher model, and save its checkpoints.
 

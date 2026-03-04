@@ -1,41 +1,42 @@
 import os
 import cv2
 import xml.etree.ElementTree as ET
-import json
 import torch
 from torch.utils.data import Dataset, ConcatDataset
 import albumentations as A
 import numpy as np # Move numpy import to the top
 
-# --- Configuration & Mapping ---
-try:
-    with open("config.json", "r", encoding="utf-8") as f:
-        CFG = json.load(f)
-    OBJ_CLASSES = CFG["obj_classes"]
-except Exception:
-    OBJ_CLASSES = ["background", "target"] # Fallback
-
-class_to_idx = {cls: i for i, cls in enumerate(OBJ_CLASSES)}
+def _default_obj_classes():
+    return ["background", "target"]
 
 class PascalVOCDataset(Dataset):
     """
     Base dataset for loading images and annotations from Pascal VOC format.
     Does not apply complex augmentations, only loads the data.
     """
-    def __init__(self, root, image_set='default', mode='RGB', transform=None):
+    def __init__(self, root, image_set='default', mode='RGB', transform=None, obj_classes=None):
         self.root = root
         self.mode = mode
         self.transform = transform
+        self.obj_classes = obj_classes if obj_classes else _default_obj_classes()
+        self.class_to_idx = {cls: i for i, cls in enumerate(self.obj_classes)}
         
-        # Try 'JPEGImages' first (standard VOC), then 'Images'
+        # Try 'JPEGImages' first (standard VOC), then 'Images', then 'Image' (VOCf)
         if os.path.exists(os.path.join(root, 'JPEGImages')):
             self.images_path = os.path.join(root, 'JPEGImages')
-        else:
+        elif os.path.exists(os.path.join(root, 'Images')):
             self.images_path = os.path.join(root, 'Images')
+        else:
+            self.images_path = os.path.join(root, 'Image')
             
         self.anno_path = os.path.join(root, 'Annotations')
         
         set_file = os.path.join(root, 'ImageSets/Main', f'{image_set}.txt')
+        # Fallback: VOCf ships a single default.txt
+        if not os.path.exists(set_file):
+            fallback_file = os.path.join(root, 'ImageSets/Main', 'default.txt')
+            if os.path.exists(fallback_file):
+                set_file = fallback_file
         
         self.ids = []
         if os.path.exists(set_file):
@@ -66,7 +67,7 @@ class PascalVOCDataset(Dataset):
         boxes, labels = [], []
         for obj in tree.getroot().findall('object'):
             name = obj.find('name').text.strip()
-            if name in class_to_idx:
+            if name in self.class_to_idx:
                 bbox = obj.find('bndbox')
                 # Pascal VOC coordinates are 1-indexed, so subtract 1 for 0-indexed for albumentations
                 xmin = float(bbox.find('xmin').text) - 1
@@ -89,7 +90,7 @@ class PascalVOCDataset(Dataset):
                     continue
 
                 boxes.append([xmin, ymin, xmax, ymax])
-                labels.append(class_to_idx[name])
+                labels.append(self.class_to_idx[name])
         
         if not boxes: return None, None # This check should be after parsing all boxes
 
@@ -106,7 +107,7 @@ class PascalVOCDataset(Dataset):
     def __len__(self):
         return len(self.ids)
 
-def get_voc_datasets(voc_root, img_size, years, transform_train=None, transform_val=None):
+def get_voc_datasets(voc_root, img_size, years, transform_train=None, transform_val=None, train_split="trainval", val_split="val", obj_classes=None):
     """
     Helper function to get combined train and validation datasets for VOC.
     """
@@ -125,8 +126,8 @@ def get_voc_datasets(voc_root, img_size, years, transform_train=None, transform_
                 print(f"Warning: VOC {year} folder not found in {voc_root}")
                 continue
         
-        train_ds = PascalVOCDataset(year_path, image_set='trainval', transform=transform_train)
-        val_ds = PascalVOCDataset(year_path, image_set='val', transform=transform_val)
+        train_ds = PascalVOCDataset(year_path, image_set=train_split, transform=transform_train, obj_classes=obj_classes)
+        val_ds = PascalVOCDataset(year_path, image_set=val_split, transform=transform_val, obj_classes=obj_classes)
         
         train_datasets.append(train_ds)
         val_datasets.append(val_ds)
@@ -134,56 +135,8 @@ def get_voc_datasets(voc_root, img_size, years, transform_train=None, transform_
     if not train_datasets:
         # Fallback: maybe voc_root IS the dataset folder
         print(f"No year-specific folders found, trying {voc_root} directly...")
-        train_ds = PascalVOCDataset(voc_root, image_set='trainval', transform=transform_train)
-        val_ds = PascalVOCDataset(voc_root, image_set='val', transform=transform_val)
-        if len(train_ds) > 0:
-            print(f"Total: {len(train_ds)} train samples, {len(val_ds)} val samples.")
-            return train_ds, val_ds
-        else:
-            raise FileNotFoundError(f"No VOC samples found in {voc_root}")
-
-    train_combined = ConcatDataset(train_datasets)
-    val_combined = ConcatDataset(val_datasets)
-    print(f"\n--- Combined Dataset Statistics ---")
-    print(f"Total Combined Train samples: {len(train_combined)}")
-    print(f"Total Combined Val samples: {len(val_combined)}")
-    print(f"-----------------------------------\n")
-
-    return train_combined, val_combined
-
-    def __len__(self):
-        return len(self.ids)
-
-def get_voc_datasets(voc_root, img_size, years, transform_train=None, transform_val=None):
-    """
-    Helper function to get combined train and validation datasets for VOC.
-    """
-    train_datasets = []
-    val_datasets = []
-    
-    # Check if root contains years directly
-    # Original train.py defaults: voc_years=["2012"], voc_root="./data/VOC"
-    for year in years:
-        # Check standard VOC structure: root/VOC2012/Images etc.
-        year_path = os.path.join(voc_root, f"VOC{year}")
-        if not os.path.exists(year_path):
-            # Try root/2012 if VOC prefix missing
-            year_path = os.path.join(voc_root, year)
-            if not os.path.exists(year_path):
-                print(f"Warning: VOC {year} folder not found in {voc_root}")
-                continue
-        
-        train_ds = PascalVOCDataset(year_path, image_set='trainval', transform=transform_train)
-        val_ds = PascalVOCDataset(year_path, image_set='val', transform=transform_val)
-        
-        train_datasets.append(train_ds)
-        val_datasets.append(val_ds)
-    
-    if not train_datasets:
-        # Fallback: maybe voc_root IS the dataset folder
-        print(f"No year-specific folders found, trying {voc_root} directly...")
-        train_ds = PascalVOCDataset(voc_root, image_set='trainval', transform=transform_train)
-        val_ds = PascalVOCDataset(voc_root, image_set='val', transform=transform_val)
+        train_ds = PascalVOCDataset(voc_root, image_set=train_split, transform=transform_train, obj_classes=obj_classes)
+        val_ds = PascalVOCDataset(voc_root, image_set=val_split, transform=transform_val, obj_classes=obj_classes)
         if len(train_ds) > 0:
             print(f"Total: {len(train_ds)} train samples, {len(val_ds)} val samples.")
             return train_ds, val_ds

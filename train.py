@@ -1,23 +1,49 @@
 import torch
 import os
+from typing import Any, Dict
 from torch.utils.data import DataLoader
+from config_utils import load_merged_config
 from data_loader import (
     get_base_transforms, 
     get_final_transforms, 
     get_eval_transforms, 
     safe_collate_fn
 )
-from dataset import MosaicMixupDataset, get_voc_datasets
+from dataset import MosaicMixupDataset, get_coco_datasets, get_voc_datasets
 from model.model import SSDGhost
 from model.ssd_custom import SSDMobile
 from trainer import DetectorTrainer
 from wandb_utils import finish_wandb, init_wandb, log_wandb
-import json
+
+def load_teacher_weights(teacher: SSDMobile, checkpoint_path: str, device: torch.device) -> None:
+    """
+    Load teacher checkpoint weights for KD.
+    Supports both full checkpoint dicts and raw model state_dict files.
+    """
+    if not checkpoint_path:
+        raise ValueError("teacher_checkpoint is empty. Please provide a valid checkpoint path.")
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Teacher checkpoint not found: {checkpoint_path}")
+
+    print(f"Loading teacher checkpoint from: {checkpoint_path}")
+    checkpoint: Dict[str, Any] = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+
+    try:
+        teacher.load_state_dict(state_dict, strict=True)
+        print("Teacher checkpoint loaded with strict=True.")
+    except RuntimeError as exc:
+        print(f"Warning: strict load failed for teacher checkpoint ({exc}). Retrying with strict=False.")
+        missing, unexpected = teacher.load_state_dict(state_dict, strict=False)
+        print(f"Teacher checkpoint loaded with strict=False. missing={len(missing)} unexpected={len(unexpected)}")
+
+    # Prevent trainer from reloading backbone pretrained weights over checkpoint values.
+    if hasattr(teacher, "backbone_has_weights_loaded"):
+        teacher.backbone_has_weights_loaded = True
 
 def main():
     # 1. Load Config
-    with open("config.json", "r") as f:
-        config = json.load(f)
+    config = load_merged_config("config/config.json")
 
     init_wandb(config)
 
@@ -25,19 +51,44 @@ def main():
     img_size = config.get("img_size", 256)
     batch_size = config.get("batch_size", 32)
     num_workers = config.get("num_workers", 4)
+    student_width = float(config.get("student_width", 0.5))
+    use_pretrained_student_backbone = config.get("use_pretrained_student_backbone", True)
+    dataset_format = str(config.get("dataset_format", "voc")).strip().lower()
     voc_years = config.get("voc_years", ["2012"])
     voc_root = config.get("voc_root", "./data/VOC")
+    coco_root = config.get("coco_root", "./data")
+    coco_train_split = config.get("coco_train_split", config.get("train_split", "train2017"))
+    coco_val_split = config.get("coco_val_split", config.get("val_split", "val2017"))
     eval_interval = max(1, int(config.get("eval_interval", 1)))
+    use_kd = bool(config.get("use_kd", True))
+    load_teacher_checkpoint_enabled = bool(config.get("load_teacher_checkpoint", True))
 
     # 2. Dataset & Loader
-    # Get combined train and validation datasets using the new helper
-    base_train_ds, base_val_ds = get_voc_datasets(
-        voc_root=voc_root,
-        img_size=img_size,
-        years=voc_years,
-        transform_train=get_base_transforms(img_size), # Base transforms for individual images
-        transform_val=get_eval_transforms(img_size) # Eval transforms for validation
-    )
+    if dataset_format == "voc":
+        # Get combined train and validation datasets using VOC helper.
+        base_train_ds, base_val_ds = get_voc_datasets(
+            voc_root=voc_root,
+            img_size=img_size,
+            years=voc_years,
+            transform_train=get_base_transforms(img_size),
+            transform_val=get_eval_transforms(img_size),
+            train_split=config.get("train_split", "trainval"),
+            val_split=config.get("val_split", "val"),
+            obj_classes=config.get("obj_classes"),
+        )
+    elif dataset_format == "coco":
+        # COCO loader auto-detects directories with or without "_coco" suffix.
+        base_train_ds, base_val_ds = get_coco_datasets(
+            coco_root=coco_root,
+            img_size=img_size,
+            transform_train=get_base_transforms(img_size),
+            transform_val=get_eval_transforms(img_size),
+            train_split=coco_train_split,
+            val_split=coco_val_split,
+            obj_classes=config.get("obj_classes"),
+        )
+    else:
+        raise ValueError("dataset_format must be either 'voc' or 'coco'.")
 
     # Wrap training dataset with Mosaic and MixUp
     train_ds = MosaicMixupDataset(
@@ -66,7 +117,12 @@ def main():
 
     # 3. Model
     num_classes = len(config["obj_classes"])
-    model = SSDGhost(num_classes=num_classes, width=0.5, img_size=img_size)
+    model = SSDGhost(
+        num_classes=num_classes,
+        width=student_width,
+        img_size=img_size,
+        backbone_pretrained=use_pretrained_student_backbone,
+    )
     model.to(device) # Move model to device BEFORE profiling
 
     # Calculate and log model complexity (total params and MAdds)
@@ -89,17 +145,30 @@ def main():
         print(f"Warning: Could not calculate model complexity: {e}")
 
 
-    # 4. Teacher Model (MobileNetV3 SSD from ssd_custom.py)
-    teacher_aspect_ratios = [[2], [2, 3], [2, 3], [2, 3], [2], [2]]
-    teacher = SSDMobile(
-        num_classes=num_classes,
-        aspect_ratios=teacher_aspect_ratios,
-        img_size=img_size,
-        s_min=0.07,
-        s_max=0.95,
-    )
-    # For distillation, teacher should be in eval mode
-    teacher.eval()
+    # 4. Teacher Model (SSDLite MobileNetV3 from ssd_custom.py)
+    teacher = None
+    if use_kd:
+        teacher_aspect_ratios = [[2], [2, 3], [2, 3], [2, 3], [2], [2]]
+        teacher_checkpoint = config.get("teacher_checkpoint", "models/teacher_best_model.pth")
+        use_pretrained_teacher_backbone = config.get("use_pretrained_teacher_backbone", True)
+        teacher = SSDMobile(
+            num_classes=num_classes,
+            aspect_ratios=teacher_aspect_ratios,
+            img_size=img_size,
+            s_min=0.07,
+            s_max=0.95,
+            pretrained_backbone=use_pretrained_teacher_backbone,
+        )
+
+        if load_teacher_checkpoint_enabled:
+            load_teacher_weights(teacher, teacher_checkpoint, device)
+        else:
+            print("Skipping teacher checkpoint loading (load_teacher_checkpoint=False).")
+
+        # For distillation, teacher should be in eval mode
+        teacher.eval()
+    else:
+        print("Knowledge distillation disabled (use_kd=False). Training without teacher model.")
 
     # 5. Trainer
     trainer_config = {
