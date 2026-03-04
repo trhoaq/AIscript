@@ -9,6 +9,13 @@
   "lr": 0.0001,
   "weight_decay": 0.0001,
   "epochs": 200,
+  "use_pretrained_student_weights": false,
+  "student_pretrained_weights": "models/student_pretrained.pth",
+  "load_student_checkpoint": false,
+  "student_checkpoint": "models/student_checkpoint.pth",
+  "student_best_model_path": "models/best_model.pth",
+  "student_final_model_path": "models/final_model.pth",
+  "student_interval_checkpoint_dir": "models",
   "score_thresh": 0.05,
   "eval_score_thresh": 0.05,
   "eval_pre_nms_topk": 400,
@@ -18,6 +25,9 @@
   "load_teacher_checkpoint": false,
   "use_pretrained_teacher_backbone": true,
   "teacher_checkpoint": "models/teacher_best_model.pth",
+  "teacher_best_model_path": "models/teacher_best_model.pth",
+  "teacher_final_model_path": "models/teacher_final_model.pth",
+  "teacher_interval_checkpoint_dir": "models",
   "wandb_project": "AIscript-Object-Detection",
   "wandb_run_name": "GhostNet-SSD-v1"
 }

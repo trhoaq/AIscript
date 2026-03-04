@@ -294,14 +294,15 @@ class DetectorTrainer:
 
     def save_interval_checkpoints(self, epoch):
         """Saves 'last' and 'best' models for the current 10-epoch interval."""
-        base_dir = "models"
+        base_dir = self.config.get("checkpoint_dir", "models")
         
         # Save 'last'
-        self.save_checkpoint(os.path.join(base_dir, f"epoch_{epoch}_last.pth"), epoch=epoch)
+        last_path = os.path.join(base_dir, f"epoch_{epoch}_last.pth") if base_dir else f"epoch_{epoch}_last.pth"
+        self.save_checkpoint(last_path, epoch=epoch)
         
         # Save 'best' of this interval
         if self.interval_best_state:
-            best_path = os.path.join(base_dir, f"epoch_{epoch}_best.pth")
+            best_path = os.path.join(base_dir, f"epoch_{epoch}_best.pth") if base_dir else f"epoch_{epoch}_best.pth"
             torch.save(self.interval_best_state, best_path)
             print(f"Saved interval best checkpoint to {best_path} (mAP@0.5: {self.interval_best_map05:.4f})")
         
@@ -310,8 +311,9 @@ class DetectorTrainer:
         self.interval_best_state = {}
 
     def save_checkpoint(self, path, epoch=None):
-        if not os.path.exists(os.path.dirname(path)):
-            os.makedirs(os.path.dirname(path))
+        dir_path = os.path.dirname(path)
+        if dir_path and not os.path.exists(dir_path):
+            os.makedirs(dir_path)
         
         state = {
             'model_state_dict': self.model.state_dict(),

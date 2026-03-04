@@ -36,6 +36,9 @@ def main():
     coco_root = config.get("coco_root", "./data")
     coco_train_split = config.get("coco_train_split", config.get("train_split", "train2017"))
     coco_val_split = config.get("coco_val_split", config.get("val_split", "val2017"))
+    teacher_best_model_path = config.get("teacher_best_model_path", "models/teacher_best_model.pth")
+    teacher_final_model_path = config.get("teacher_final_model_path", "models/teacher_final_model.pth")
+    teacher_interval_checkpoint_dir = config.get("teacher_interval_checkpoint_dir", "models")
     eval_interval = max(1, int(config.get("eval_interval", 1)))
 
     # 2. Dataset & Loader
@@ -132,6 +135,7 @@ def main():
         'eval_score_thresh': config.get('eval_score_thresh', config.get('score_thresh', 0.05)),
         'eval_pre_nms_topk': config.get('eval_pre_nms_topk', 400),
         'eval_max_detections': config.get('eval_max_detections', 100),
+        'checkpoint_dir': teacher_interval_checkpoint_dir,
     }
     
     # Pass None for teacher_model as we are training the model itself
@@ -169,7 +173,7 @@ def main():
                     'val_mAP_0_5': val_mAP_0_5
                 }
                 # No feature_adapters for teacher model
-                trainer.save_checkpoint("models/teacher_best_model.pth")
+                trainer.save_checkpoint(teacher_best_model_path)
                 print(f"Validation mAP@0.5 improved to {trainer.best_val_map05:.4f}. Saving best teacher model state.")
             else:
                 trainer.epochs_no_improve += 1
@@ -201,7 +205,7 @@ def main():
             break # Exit training loop
 
     # Save final model state after training (or early stopping)
-    trainer.save_checkpoint(f"models/teacher_final_model.pth")
+    trainer.save_checkpoint(teacher_final_model_path)
 
     finish_wandb()
 

@@ -15,6 +15,33 @@ from model.ssd_custom import SSDMobile
 from trainer import DetectorTrainer
 from wandb_utils import finish_wandb, init_wandb, log_wandb
 
+def load_student_weights(
+    model: SSDGhost,
+    checkpoint_path: str,
+    device: torch.device,
+    source_name: str = "student checkpoint",
+) -> None:
+    """
+    Load student checkpoint weights from local file in ./models.
+    Supports full checkpoint dict or raw state_dict.
+    """
+    if not checkpoint_path:
+        raise ValueError(f"{source_name} path is empty. Please provide a valid checkpoint path.")
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"{source_name} not found: {checkpoint_path}")
+
+    print(f"Loading {source_name} from: {checkpoint_path}")
+    checkpoint: Dict[str, Any] = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+
+    try:
+        model.load_state_dict(state_dict, strict=True)
+        print(f"{source_name} loaded with strict=True.")
+    except RuntimeError as exc:
+        print(f"Warning: strict load failed for {source_name} ({exc}). Retrying with strict=False.")
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"{source_name} loaded with strict=False. missing={len(missing)} unexpected={len(unexpected)}")
+
 def load_teacher_weights(teacher: SSDMobile, checkpoint_path: str, device: torch.device) -> None:
     """
     Load teacher checkpoint weights for KD.
@@ -52,7 +79,13 @@ def main():
     batch_size = config.get("batch_size", 32)
     num_workers = config.get("num_workers", 4)
     student_width = float(config.get("student_width", 0.5))
-    use_pretrained_student_backbone = config.get("use_pretrained_student_backbone", True)
+    use_pretrained_student_weights = bool(config.get("use_pretrained_student_weights", False))
+    student_pretrained_weights = config.get("student_pretrained_weights", "models/student_pretrained.pth")
+    load_student_checkpoint_enabled = bool(config.get("load_student_checkpoint", False))
+    student_checkpoint = config.get("student_checkpoint", "models/student_checkpoint.pth")
+    student_best_model_path = config.get("student_best_model_path", "models/best_model.pth")
+    student_final_model_path = config.get("student_final_model_path", "models/final_model.pth")
+    student_interval_checkpoint_dir = config.get("student_interval_checkpoint_dir", "models")
     dataset_format = str(config.get("dataset_format", "voc")).strip().lower()
     voc_years = config.get("voc_years", ["2012"])
     voc_root = config.get("voc_root", "./data/VOC")
@@ -121,9 +154,12 @@ def main():
         num_classes=num_classes,
         width=student_width,
         img_size=img_size,
-        backbone_pretrained=use_pretrained_student_backbone,
     )
     model.to(device) # Move model to device BEFORE profiling
+    if use_pretrained_student_weights:
+        load_student_weights(model, student_pretrained_weights, device, source_name="student pretrained weights")
+    if use_pretrained_student_weights and load_student_checkpoint_enabled:
+        print("Both student pretrained weights and student checkpoint are enabled. Checkpoint will override model weights.")
 
     # Calculate and log model complexity (total params and MAdds)
     try:
@@ -183,15 +219,23 @@ def main():
         'eval_score_thresh': config.get('eval_score_thresh', config.get('score_thresh', 0.05)),
         'eval_pre_nms_topk': config.get('eval_pre_nms_topk', 400),
         'eval_max_detections': config.get('eval_max_detections', 100),
+        'checkpoint_dir': student_interval_checkpoint_dir,
     }
     
     trainer = DetectorTrainer(model, train_loader, val_loader, device, trainer_config)
 
     # Resume training if checkpoint exists
-    resume_checkpoint = config.get("resume_checkpoint")
     start_epoch = 0
-    if resume_checkpoint and os.path.exists(resume_checkpoint):
-        start_epoch = trainer.load_checkpoint(resume_checkpoint)
+    if load_student_checkpoint_enabled:
+        if not student_checkpoint:
+            raise ValueError("student_checkpoint is empty. Please provide a valid checkpoint path.")
+        if not os.path.exists(student_checkpoint):
+            raise FileNotFoundError(f"Student checkpoint not found: {student_checkpoint}")
+        start_epoch = trainer.load_checkpoint(student_checkpoint)
+    else:
+        resume_checkpoint = config.get("resume_checkpoint")
+        if resume_checkpoint and os.path.exists(resume_checkpoint):
+            start_epoch = trainer.load_checkpoint(resume_checkpoint)
 
     # 6. Training Loop
     print(f"Starting training GhostNet SSD 0.5x on {device}...")
@@ -220,7 +264,7 @@ def main():
                 }
                 if trainer.feature_adapters:
                     trainer.best_model_state['adapters_state_dict'] = trainer.feature_adapters.state_dict()
-                trainer.save_checkpoint("models/best_model.pth")
+                trainer.save_checkpoint(student_best_model_path)
                 print(f"Validation mAP@0.5 improved to {trainer.best_val_map05:.4f}. Saving best model state.")
             else:
                 trainer.epochs_no_improve += 1
@@ -253,7 +297,7 @@ def main():
             break # Exit training loop
 
     # Save final model state after training (or early stopping)
-    trainer.save_checkpoint(f"models/final_model.pth")
+    trainer.save_checkpoint(student_final_model_path)
     
     finish_wandb()
 

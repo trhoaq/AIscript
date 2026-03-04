@@ -209,5 +209,5 @@ __marimo__/
 # Else
 data/
 .py
-
+paper/
 # Ignore all markdown files except README.md

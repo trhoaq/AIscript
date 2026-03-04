@@ -29,26 +29,34 @@ def _normalize_split_name(split: str) -> str:
 def _resolve_images_dir(root: str, split: str) -> str:
     split = split.strip()
     normalized_split = _normalize_split_name(split)
-    candidates = [
-        os.path.join(root, split),
-        os.path.join(root, "images"),
-        os.path.join(root, "Images"),
-        os.path.join(root, "JPEGImages"),
-    ]
+    candidates = []
+
+    # Preferred layout: root/<split> (e.g. root/train2017, root/val2017)
     if normalized_split != split:
         candidates.append(os.path.join(root, normalized_split))
+    candidates.append(os.path.join(root, split))
+
     if split.endswith("_coco"):
         candidates.append(os.path.join(root, f"{normalized_split}_coco"))
     else:
-        candidates.append(os.path.join(root, f"{split}_coco"))
         if normalized_split != split:
             candidates.append(os.path.join(root, f"{normalized_split}_coco"))
+        candidates.append(os.path.join(root, f"{split}_coco"))
 
-    # Common layout: root/images/<split>
+    # Secondary layout: root/images/<split>
     for images_dir_name in ("images", "Images", "JPEGImages"):
-        candidates.append(os.path.join(root, images_dir_name, split))
         if normalized_split != split:
             candidates.append(os.path.join(root, images_dir_name, normalized_split))
+        candidates.append(os.path.join(root, images_dir_name, split))
+
+    # Fallback layout: images placed directly under root/images
+    candidates.extend(
+        [
+            os.path.join(root, "images"),
+            os.path.join(root, "Images"),
+            os.path.join(root, "JPEGImages"),
+        ]
+    )
 
     seen = set()
     for path in candidates:

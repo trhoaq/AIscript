@@ -32,7 +32,7 @@ class DepthwiseSeparableConv(nn.Module):
         return self.act(self.bn(self.pointwise(self.depthwise(x))))
 
 class GhostNetBackbone(nn.Module):
-    def __init__(self, width=0.5, timm_pretrained=False):
+    def __init__(self, width=0.5):
         super().__init__()
         # GhostNet Configuration
         cfgs = [
@@ -55,41 +55,6 @@ class GhostNetBackbone(nn.Module):
         
         # Indices for feature extraction
         self.feature_indices = [4, 6, 8] 
-        
-    #     if timm_pretrained:
-    #         self._load_timm_pretrained(width)
-
-    # def _load_timm_pretrained(self, width):
-    #     # Map supported width multipliers to their timm model identifiers.
-    #     timm_models = {
-    #         1.0: "ghostnet_100.in1k",
-    #     }
-    #     width_key = round(float(width), 2)
-    #     if width_key not in timm_models:
-    #         print(f"GhostNetBackbone: timm preload supports widths {list(timm_models.keys())}, received width={width}. Skipping.")
-    #         return
-
-    #     try:
-    #         import timm  # type: ignore
-    #     except Exception as e:
-    #         print(f"GhostNetBackbone: timm not available ({e}), skipping pretrained load.")
-    #         return
-
-    #     model_name = timm_models[width_key]
-    #     try:
-    #         timm_model = timm.create_model(model_name, pretrained=True)
-    #     except Exception as e:
-    #         print(f"GhostNetBackbone: failed to create timm model '{model_name}' ({e}).")
-    #         return
-
-    #     try:
-    #         missing, unexpected = self.load_state_dict(timm_model.state_dict(), strict=False)
-    #         if missing or unexpected:
-    #             print(f"GhostNetBackbone: loaded timm weights ({model_name}) with missing={len(missing)} unexpected={len(unexpected)}")
-    #         else:
-    #             print(f"GhostNetBackbone: loaded timm weights from '{model_name}'.")
-    #     except Exception as e:
-    #         print(f"GhostNetBackbone: failed to load timm {model_name} pretrained weights ({e}).")
 
     def forward(self, x):
         x = self.act1(self.bn1(self.conv_stem(x)))
@@ -121,7 +86,7 @@ class FPNLitePConv(nn.Module):
 # --- Main Model ---
 
 class SSDGhost(nn.Module):
-    def __init__(self, num_classes, width=0.5, img_size=256, score_thresh=0.05, nms_thresh=0.45, backbone_pretrained=True):
+    def __init__(self, num_classes, width=0.5, img_size=256, score_thresh=0.05, nms_thresh=0.45):
         super().__init__()
         self.num_classes = num_classes
         self.img_size = img_size
@@ -134,7 +99,7 @@ class SSDGhost(nn.Module):
         self.anchor_generator = DefaultBoxGenerator(self.aspect_ratios)
         self.num_anchors = self.anchor_generator.num_anchors_per_location()
 
-        self.backbone = GhostNetBackbone(width=width, timm_pretrained=backbone_pretrained)
+        self.backbone = GhostNetBackbone(width=width)
         self.fpn = FPNLitePConv(self.backbone.out_channels, out_channels=64)
         
         self.cls_heads = nn.ModuleList()
