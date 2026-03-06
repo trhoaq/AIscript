@@ -1,7 +1,8 @@
 import torch
 import os
 import gc
-from typing import Any, Dict
+import re
+from typing import Any, Dict, Optional
 from torch.utils.data import DataLoader
 from config_utils import load_merged_config
 from data_loader import (
@@ -41,6 +42,30 @@ def load_teacher_weights(teacher: SSDMobile, checkpoint_path: str, device: torch
     # Prevent trainer from reloading backbone pretrained weights over checkpoint values.
     if hasattr(teacher, "backbone_has_weights_loaded"):
         teacher.backbone_has_weights_loaded = True
+
+
+def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
+    if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+        return None
+
+    checkpoints = [
+        os.path.join(checkpoint_dir, f)
+        for f in os.listdir(checkpoint_dir)
+        if f.lower().endswith(".pth")
+    ]
+    if not checkpoints:
+        return None
+
+    def sort_key(path: str):
+        name = os.path.basename(path)
+        match = re.match(r"epoch_(\d+)_(last|best)\.pth$", name)
+        if match:
+            epoch = int(match.group(1))
+            kind_priority = 2 if match.group(2) == "last" else 1
+            return (1, epoch, kind_priority, os.path.getmtime(path))
+        return (0, 0, 0, os.path.getmtime(path))
+
+    return max(checkpoints, key=sort_key)
 
 def main():
     # 1. Load Config
@@ -222,16 +247,30 @@ def main():
 
     # Resume training if checkpoint exists
     start_epoch = 0
+    resume_path = None
+
     if load_student_checkpoint_enabled:
         if not student_checkpoint:
             raise ValueError("student_checkpoint is empty. Please provide a valid checkpoint path.")
-        if not os.path.exists(student_checkpoint):
-            raise FileNotFoundError(f"Student checkpoint not found: {student_checkpoint}")
-        start_epoch = trainer.load_checkpoint(student_checkpoint)
+        if os.path.exists(student_checkpoint):
+            resume_path = student_checkpoint
+        else:
+            print(f"Configured student checkpoint not found: {student_checkpoint}. Falling back to latest checkpoint in dir.")
     else:
         resume_checkpoint = config.get("resume_checkpoint")
         if resume_checkpoint and os.path.exists(resume_checkpoint):
-            start_epoch = trainer.load_checkpoint(resume_checkpoint)
+            resume_path = resume_checkpoint
+
+    if resume_path is None:
+        latest_checkpoint = find_latest_checkpoint(student_interval_checkpoint_dir)
+        if latest_checkpoint:
+            resume_path = latest_checkpoint
+            print(f"Auto-resume found latest student checkpoint: {resume_path}")
+
+    if resume_path:
+        start_epoch = trainer.load_checkpoint(resume_path)
+    else:
+        print("No student checkpoint found. Starting from scratch.")
 
     # 6. Training Loop
     print(f"Starting training SSDLite GhostNet {student_width:.1f}x on {device}...")

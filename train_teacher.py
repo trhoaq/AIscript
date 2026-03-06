@@ -1,6 +1,7 @@
 import torch # type: ignore
 import os, sys
 import gc
+import re
 from torch.utils.data import DataLoader # type: ignore
 from config_utils import load_merged_config
 from data_loader import (
@@ -14,7 +15,31 @@ from dataset import MosaicMixupDataset, get_coco_datasets, get_voc_datasets, set
 from model.ssdlite_mobilenet import SSDMobile 
 from trainer import DetectorTrainer
 from wandb_utils import finish_wandb, init_wandb, log_wandb
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+
+
+def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
+    if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+        return None
+
+    checkpoints = [
+        os.path.join(checkpoint_dir, f)
+        for f in os.listdir(checkpoint_dir)
+        if f.lower().endswith(".pth")
+    ]
+    if not checkpoints:
+        return None
+
+    def sort_key(path: str):
+        name = os.path.basename(path)
+        match = re.match(r"epoch_(\d+)_(last|best)\.pth$", name)
+        if match:
+            epoch = int(match.group(1))
+            kind_priority = 2 if match.group(2) == "last" else 1
+            return (1, epoch, kind_priority, os.path.getmtime(path))
+        return (0, 0, 0, os.path.getmtime(path))
+
+    return max(checkpoints, key=sort_key)
 
 def main():
     # 1. Load Config
@@ -160,8 +185,22 @@ def main():
     # Resume training if checkpoint exists
     resume_checkpoint = config.get("resume_checkpoint")
     start_epoch = 0
+    resume_path = None
     if resume_checkpoint and os.path.exists(resume_checkpoint):
-        start_epoch = trainer.load_checkpoint(resume_checkpoint)
+        resume_path = resume_checkpoint
+    elif resume_checkpoint:
+        print(f"Configured resume checkpoint not found: {resume_checkpoint}. Falling back to latest checkpoint in dir.")
+
+    if resume_path is None:
+        latest_checkpoint = find_latest_checkpoint(teacher_interval_checkpoint_dir)
+        if latest_checkpoint:
+            resume_path = latest_checkpoint
+            print(f"Auto-resume found latest teacher checkpoint: {resume_path}")
+
+    if resume_path:
+        start_epoch = trainer.load_checkpoint(resume_path)
+    else:
+        print("No teacher checkpoint found. Starting from scratch.")
 
     # 5. Training Loop
     print(f"Starting training SSDMobile Teacher Model on {device}...")

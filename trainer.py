@@ -380,6 +380,10 @@ class DetectorTrainer:
         if self.feature_adapters and 'adapters_state_dict' in checkpoint:
             self.feature_adapters.load_state_dict(checkpoint['adapters_state_dict'])
             
-        start_epoch = checkpoint.get('epoch', 0)
+        raw_epoch = checkpoint.get('epoch', 0)
+        try:
+            start_epoch = int(raw_epoch) if raw_epoch is not None else 0
+        except (TypeError, ValueError):
+            start_epoch = 0
         print(f"Checkpoint loaded. Resuming from epoch {start_epoch + 1}.")
         return start_epoch
