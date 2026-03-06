@@ -104,10 +104,8 @@ def main():
     # 3. Model (This will be the SSDMobile model)
     num_classes = len(config["obj_classes"])
     teacher_aspect_ratios = [[2], [2, 3], [2, 3], [2, 3], [2], [2]] # SSDMobile's aspect ratios
-    use_pretrained_teacher_backbone = config.get("use_pretrained_teacher_backbone", True) # Default to True
-    teacher_pretrained_backbone_model = str(
-        config.get("teacher_pretrained_backbone_model", "mobilenetv3_large_100")
-    ).strip()
+    use_pretrained_teacher_backbone = True
+    teacher_pretrained_backbone_model = "mobilenetv3_large_100"
     model = SSDMobile(
         num_classes=num_classes,
         aspect_ratios=teacher_aspect_ratios,
@@ -175,9 +173,21 @@ def main():
         # Evaluate based on configured interval to avoid expensive validation every epoch.
         should_eval = (epoch % eval_interval == 0)
         if should_eval:
-            val_loss, val_mAP_0_5, val_precision, val_recall = trainer.evaluate_epoch(epoch)
+            (
+                val_loss,
+                val_mAP_0_5,
+                val_precision_0_5,
+                val_recall_0_5,
+                val_mAP_0_95,
+                val_precision_0_95,
+                val_recall_0_95,
+            ) = trainer.evaluate_epoch(epoch)
             if val_loss is not None:
-                print(f"Epoch {epoch}/{trainer_config['epochs']} | Val Loss: {val_loss:.4f} | mAP@0.5: {val_mAP_0_5:.4f} | P@0.5: {val_precision:.4f} | R@0.5: {val_recall:.4f}")
+                print(
+                    f"Epoch {epoch}/{trainer_config['epochs']} | Val Loss: {val_loss:.4f} "
+                    f"| mAP@0.5: {val_mAP_0_5:.4f} | P@0.5: {val_precision_0_5:.4f} | R@0.5: {val_recall_0_5:.4f} "
+                    f"| mAP@0.95: {val_mAP_0_95:.4f} | P@0.95: {val_precision_0_95:.4f} | R@0.95: {val_recall_0_95:.4f}"
+                )
 
             # Early Stopping Logic (only update when an eval is run)
             if val_mAP_0_5 > trainer.best_val_map05:

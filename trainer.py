@@ -6,7 +6,6 @@ import gc
 from tqdm import tqdm
 import os
 from typing import List, Dict, Any
-from model.ssdlite_mobilenet import SSDMobile
 from model.utils import calculate_stats, compute_metrics # Import manual metrics
 from wandb_utils import is_wandb_active, log_wandb
 # Removed torchmetrics import
@@ -56,10 +55,7 @@ class DetectorTrainer:
         self.config = config
         self.use_wandb = is_wandb_active()
 
-        # If the main model is SSDMobile and pretrained_backbone is enabled, load its pretrained weights
-        from model.ssdlite_mobilenet import SSDMobile
-        if isinstance(self.model, SSDMobile) and self.model.pretrained_backbone and not self.model.backbone_has_weights_loaded:
-            self.model.load_pretrained_weights(self.device)
+        self._maybe_load_pretrained_backbone(self.model)
         
         # Teacher model for Distillation
         self.teacher_model = config.get('teacher_model')
@@ -71,10 +67,7 @@ class DetectorTrainer:
         if self.teacher_model:
             self.teacher_model.to(self.device)
             self.teacher_model.eval()
-            
-            # If the teacher model is SSDMobile, ensure its weights are loaded
-            if isinstance(self.teacher_model, SSDMobile) and self.teacher_model.pretrained_backbone and not self.teacher_model.backbone_has_weights_loaded:
-                self.teacher_model.load_pretrained_weights(self.device)
+            self._maybe_load_pretrained_backbone(self.teacher_model)
 
             self.distill_criterion = DistillationLoss(
                 kd_feature_weight=config.get('kd_feature_weight', 1.0),
@@ -126,6 +119,19 @@ class DetectorTrainer:
         self.interval_best_state: Dict[str, Any] = {}
         
         print(f"Early stopping patience set to: {self.early_stopping_patience}")
+
+    def _maybe_load_pretrained_backbone(self, model: nn.Module) -> None:
+        """Load ImageNet pretrained backbone if model exposes the SSD pretrained API."""
+        has_api = (
+            hasattr(model, "pretrained_backbone")
+            and hasattr(model, "backbone_has_weights_loaded")
+            and hasattr(model, "load_pretrained_weights")
+        )
+        if not has_api:
+            return
+
+        if bool(getattr(model, "pretrained_backbone")) and not bool(getattr(model, "backbone_has_weights_loaded")):
+            model.load_pretrained_weights(self.device)
 
     def train_epoch(self, epoch):
         self.model.train()
@@ -208,7 +214,7 @@ class DetectorTrainer:
     def evaluate_epoch(self, epoch):
         if self.val_loader is None:
             print("Validation loader not provided. Skipping evaluation.")
-            return None, None, None, None
+            return None, None, None, None, None, None, None
 
         self.model.eval()
         if self.feature_adapters:
@@ -266,16 +272,20 @@ class DetectorTrainer:
                         "labels": original_targets[i]["labels"],
                     })
         
-        # Compute mAP, Precision, Recall using manual utilities
+        # Compute mAP, Precision, Recall at IoU 0.5 and 0.95 using manual utilities
         avg_val_loss = total_val_loss / len(self.val_loader) if len(self.val_loader) > 0 else 0
 
         if len(all_preds) > 0 and len(all_targets) > 0:
-            stats = calculate_stats(all_preds, all_targets, iou_threshold=0.5)
-            mAP_0_5, precision_0_5, recall_0_5 = compute_metrics(stats)
+            stats_0_5 = calculate_stats(all_preds, all_targets, iou_threshold=0.5)
+            mAP_0_5, precision_0_5, recall_0_5 = compute_metrics(stats_0_5)
+            stats_0_95 = calculate_stats(all_preds, all_targets, iou_threshold=0.95)
+            mAP_0_95, precision_0_95, recall_0_95 = compute_metrics(stats_0_95)
         else:
             mAP_0_5, precision_0_5, recall_0_5 = 0.0, 0.0, 0.0
-            print("Warning: No valid predictions or targets for mAP calculation in this epoch. Setting metrics to 0.")
+            mAP_0_95, precision_0_95, recall_0_95 = 0.0, 0.0, 0.0
+            print("Warning: No valid predictions or targets for metric calculation in this epoch. Setting metrics to 0.")
         f1_0_5 = 2 * precision_0_5 * recall_0_5 / (precision_0_5 + recall_0_5 + 1e-16)
+        f1_0_95 = 2 * precision_0_95 * recall_0_95 / (precision_0_95 + recall_0_95 + 1e-16)
 
         # Return relevant metrics
         if self.use_wandb:
@@ -286,6 +296,10 @@ class DetectorTrainer:
                     "val/Precision@0.5": precision_0_5,
                     "val/Recall@0.5": recall_0_5,
                     "val/F1@0.5": f1_0_5,
+                    "val/mAP@0.95": mAP_0_95,
+                    "val/Precision@0.95": precision_0_95,
+                    "val/Recall@0.95": recall_0_95,
+                    "val/F1@0.95": f1_0_95,
                 },
                 step=epoch,
             )
@@ -310,7 +324,7 @@ class DetectorTrainer:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        return avg_val_loss, mAP_0_5, precision_0_5, recall_0_5
+        return avg_val_loss, mAP_0_5, precision_0_5, recall_0_5, mAP_0_95, precision_0_95, recall_0_95
 
     def save_interval_checkpoints(self, epoch):
         """Saves 'last' and 'best' models for the current 10-epoch interval."""

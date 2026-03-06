@@ -11,7 +11,7 @@ from data_loader import (
     safe_collate_fn
 )
 from dataset import MosaicMixupDataset, get_coco_datasets, get_voc_datasets, set_seed_everything
-from model.model import SSDGhost
+from model.ssdlite_ghostnet100 import SSDGhostNet100
 from model.ssdlite_mobilenet import SSDMobile
 from trainer import DetectorTrainer
 from wandb_utils import finish_wandb, init_wandb, log_wandb
@@ -57,15 +57,11 @@ def main():
     batch_size = config.get("batch_size", 32)
     num_workers = config.get("num_workers", 4)
     student_width = float(config.get("student_width", 1.0))
-    use_pretrained_student_backbone = bool(
-        config.get("pretrain", config.get("use_pretrained_student_backbone", True))
-    )
-    student_pretrained_backbone_model = str(
-        config.get(
-            "student_pretrained_backbone_model",
-            config.get("student_imagenet_pretrained_model", "mobilenetv3_large_100"),
-        )
-    ).strip()
+    # Hard-configured ImageNet-1k pretrained backbones from timm.
+    use_pretrained_student_backbone = True
+    use_pretrained_teacher_backbone = True
+    student_pretrained_backbone_model = "ghostnet_100"
+    teacher_pretrained_backbone_model = "mobilenetv3_large_100"
     load_student_checkpoint_enabled = bool(config.get("load_student_checkpoint", False))
     student_checkpoint = config.get("student_checkpoint", "models/student_checkpoint.pth")
     student_best_model_path = config.get("student_best_model_path", "models/best_model.pth")
@@ -82,6 +78,12 @@ def main():
     eval_interval = max(1, int(config.get("eval_interval", 1)))
     use_kd = bool(config.get("use_kd", True))
     load_teacher_checkpoint_enabled = bool(config.get("load_teacher_checkpoint", True))
+    kd_teacher_model_path = str(
+        config.get(
+            "kd_teacher_model_path",
+            config.get("teacher_best_model_path", "models/teacher/best_model.pth"),
+        )
+    ).strip()
 
     # 2. Dataset & Loader
     if dataset_format == "voc":
@@ -140,9 +142,9 @@ def main():
 
     # 3. Model
     num_classes = len(config["obj_classes"])
-    model = SSDGhost(
+    model = SSDGhostNet100(
         num_classes=num_classes,
-        width=student_width,
+        width_mult=student_width,
         img_size=img_size,
         pretrained_backbone=use_pretrained_student_backbone,
         pretrained_backbone_model_name=student_pretrained_backbone_model,
@@ -179,11 +181,7 @@ def main():
     teacher = None
     if use_kd:
         teacher_aspect_ratios = [[2], [2, 3], [2, 3], [2, 3], [2], [2]]
-        teacher_checkpoint = config.get("teacher_checkpoint", "models/teacher_best_model.pth")
-        use_pretrained_teacher_backbone = config.get("use_pretrained_teacher_backbone", True)
-        teacher_pretrained_backbone_model = str(
-            config.get("teacher_pretrained_backbone_model", "mobilenetv3_large_100")
-        ).strip()
+        teacher_checkpoint = kd_teacher_model_path
         teacher = SSDMobile(
             num_classes=num_classes,
             aspect_ratios=teacher_aspect_ratios,
@@ -236,7 +234,7 @@ def main():
             start_epoch = trainer.load_checkpoint(resume_checkpoint)
 
     # 6. Training Loop
-    print(f"Starting training SSDLite MobileNetV3 {student_width:.1f}x on {device}...")
+    print(f"Starting training SSDLite GhostNet {student_width:.1f}x on {device}...")
     for epoch in range(start_epoch + 1, trainer_config['epochs'] + 1):
         train_loss = trainer.train_epoch(epoch)
         if train_loss is not None:
@@ -245,9 +243,21 @@ def main():
         # Evaluate based on configured interval to avoid expensive validation every epoch.
         should_eval = (epoch % eval_interval == 0)
         if should_eval:
-            val_loss, val_mAP_0_5, val_precision, val_recall = trainer.evaluate_epoch(epoch)
+            (
+                val_loss,
+                val_mAP_0_5,
+                val_precision_0_5,
+                val_recall_0_5,
+                val_mAP_0_95,
+                val_precision_0_95,
+                val_recall_0_95,
+            ) = trainer.evaluate_epoch(epoch)
             if val_loss is not None:
-                print(f"Epoch {epoch}/{trainer_config['epochs']} | Val Loss: {val_loss:.4f} | mAP@0.5: {val_mAP_0_5:.4f} | P@0.5: {val_precision:.4f} | R@0.5: {val_recall:.4f}")
+                print(
+                    f"Epoch {epoch}/{trainer_config['epochs']} | Val Loss: {val_loss:.4f} "
+                    f"| mAP@0.5: {val_mAP_0_5:.4f} | P@0.5: {val_precision_0_5:.4f} | R@0.5: {val_recall_0_5:.4f} "
+                    f"| mAP@0.95: {val_mAP_0_95:.4f} | P@0.95: {val_precision_0_95:.4f} | R@0.95: {val_recall_0_95:.4f}"
+                )
 
             # Early Stopping Logic (only update when an eval is run)
             if val_mAP_0_5 > trainer.best_val_map05:
