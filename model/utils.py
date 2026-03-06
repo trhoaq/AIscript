@@ -20,12 +20,64 @@ def _cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
     y2 = cy + 0.5 * h
     return torch.stack([x1, y1, x2, y2], dim=1)
 
+
+def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """Pairwise IoU for boxes in (xmin, ymin, xmax, ymax) format."""
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return boxes1.new_zeros((boxes1.size(0), boxes2.size(0)))
+
+    lt = torch.maximum(boxes1[:, None, :2], boxes2[:, :2])
+    rb = torch.minimum(boxes1[:, None, 2:], boxes2[:, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+
+    area1 = ((boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0))[:, None]
+    area2 = ((boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0))[None, :]
+    union = area1 + area2 - inter
+    return inter / (union + 1e-16)
+
+
+def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torch.Tensor:
+    """Non-maximum suppression implemented with native PyTorch ops."""
+    if boxes.numel() == 0:
+        return boxes.new_zeros((0,), dtype=torch.long)
+
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    areas = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
+    order = scores.argsort(descending=True)
+    keep: List[int] = []
+
+    while order.numel() > 0:
+        i = int(order[0])
+        keep.append(i)
+        if order.numel() == 1:
+            break
+
+        rest = order[1:]
+        xx1 = torch.maximum(x1[i], x1[rest])
+        yy1 = torch.maximum(y1[i], y1[rest])
+        xx2 = torch.minimum(x2[i], x2[rest])
+        yy2 = torch.minimum(y2[i], y2[rest])
+
+        w = (xx2 - xx1).clamp(min=0)
+        h = (yy2 - yy1).clamp(min=0)
+        inter = w * h
+        union = areas[i] + areas[rest] - inter
+        iou = inter / (union + 1e-16)
+
+        remain = torch.where(iou <= iou_threshold)[0]
+        order = rest[remain]
+
+    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
+
 def calculate_stats(preds: List[torch.Tensor], targets: List[dict], iou_threshold: float = 0.5):
     """
     Super optimized calculation of TP/FP using vectorized operations and efficient CPU matching.
     """
     import numpy as np
-    from torchvision.ops import box_iou
     
     if not preds: return {}
     

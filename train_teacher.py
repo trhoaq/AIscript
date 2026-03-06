@@ -1,5 +1,6 @@
 import torch # type: ignore
 import os, sys
+import gc
 from torch.utils.data import DataLoader # type: ignore
 from config_utils import load_merged_config
 from data_loader import (
@@ -8,9 +9,9 @@ from data_loader import (
     get_eval_transforms, 
     safe_collate_fn
 )
-from dataset import MosaicMixupDataset, get_coco_datasets, get_voc_datasets
+from dataset import MosaicMixupDataset, get_coco_datasets, get_voc_datasets, set_seed_everything
 # ONLY IMPORT SSDMobile, this is the model we are training (the teacher)
-from model.ssd_custom import SSDMobile 
+from model.ssdlite_mobilenet import SSDMobile 
 from trainer import DetectorTrainer
 from wandb_utils import finish_wandb, init_wandb, log_wandb
 from typing import Dict, Any
@@ -26,6 +27,10 @@ def main():
 
     init_wandb(config, default_run_name="Teacher-Training")
 
+    seed = int(config.get("seed", 42))
+    deterministic = bool(config.get("deterministic", False))
+    set_seed_everything(seed, deterministic=deterministic)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     img_size = config.get("img_size", 256)
     batch_size = config.get("batch_size", 32)
@@ -33,6 +38,8 @@ def main():
     dataset_format = str(config.get("dataset_format", "voc")).strip().lower()
     voc_years = config.get("voc_years", ["2012"])
     voc_root = config.get("voc_root", "./data/VOC")
+    voc_auto_split = bool(config.get("voc_auto_split", True))
+    voc_val_ratio = float(config.get("voc_val_ratio", 0.2))
     coco_root = config.get("coco_root", "./data")
     coco_train_split = config.get("coco_train_split", config.get("train_split", "train2017"))
     coco_val_split = config.get("coco_val_split", config.get("val_split", "val2017"))
@@ -52,6 +59,9 @@ def main():
             train_split=config.get("train_split", "trainval"),
             val_split=config.get("val_split", "val"),
             obj_classes=config.get("obj_classes"),
+            auto_split=voc_auto_split,
+            split_seed=seed,
+            val_ratio=voc_val_ratio,
         )
     elif dataset_format == "coco":
         base_train_ds, base_val_ds = get_coco_datasets(
@@ -95,6 +105,9 @@ def main():
     num_classes = len(config["obj_classes"])
     teacher_aspect_ratios = [[2], [2, 3], [2, 3], [2, 3], [2], [2]] # SSDMobile's aspect ratios
     use_pretrained_teacher_backbone = config.get("use_pretrained_teacher_backbone", True) # Default to True
+    teacher_pretrained_backbone_model = str(
+        config.get("teacher_pretrained_backbone_model", "mobilenetv3_large_100")
+    ).strip()
     model = SSDMobile(
         num_classes=num_classes,
         aspect_ratios=teacher_aspect_ratios,
@@ -102,6 +115,7 @@ def main():
         s_min=0.07,
         s_max=0.95,
         pretrained_backbone=use_pretrained_teacher_backbone, # Pass the new parameter
+        pretrained_backbone_model_name=teacher_pretrained_backbone_model,
     )
     model.to(device) # Move model to device BEFORE profiling
 
@@ -112,12 +126,16 @@ def main():
         # Create a dummy copy to avoid polluting the main model with hooks
         model_copy = copy.deepcopy(model).to(device)
         dummy_input = torch.randn(1, 3, img_size, img_size).to(device)
-        total_madds, total_params = profile(model_copy, inputs=(dummy_input,), verbose=False)
+        with torch.no_grad():
+            total_madds, total_params = profile(model_copy, inputs=(dummy_input,), verbose=False)
         print(f"\n--- Teacher Model Complexity ---")
         print(f"Total Parameters: {total_params / 1e6:.2f} M")
         print(f"Total MAdds (Giga): {total_madds / 1e9:.2f} G")
         print(f"--------------------------------\n")
-        del model_copy # Cleanup
+        del model_copy, dummy_input # Cleanup
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     except ImportError:
         print("Warning: 'thop' library not found. Skipping calculation of teacher model parameters and MAdds.")
         print("Install with: pip install thop")

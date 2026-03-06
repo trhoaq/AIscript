@@ -1,5 +1,4 @@
 torch>=1.9.0
-torchvision>=0.10.0
 torchmetrics[detection]
 albumentations>=1.0.0
 opencv-python>=4.5.0

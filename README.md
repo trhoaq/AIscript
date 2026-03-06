@@ -25,7 +25,7 @@ This project implements an ultra-light object detection system optimized for res
 │   ├── ghostnet.py         # GhostNet backbone implementation
 │   ├── mobilenetv3_torch.py# MobileNetV3 implementation details
 │   ├── model.py            # SSDGhost (student) model definition
-│   ├── ssd_custom.py       # SSDMobile (teacher) model definition
+│   ├── ssdlite_mobilenet.py# SSDMobile (teacher) model definition
 │   └── utils.py            # Shared utility functions (bbox ops, anchor generation)
 ├── data_loader.py          # Custom Pascal VOC Dataset, Mosaic/MixUp logic, transforms
 ├── trainer.py              # Generic DetectorTrainer for training and evaluation

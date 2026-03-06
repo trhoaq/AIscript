@@ -1,6 +1,6 @@
 {
   "voc_root": "./data",
-  "voc_years": ["2012"],
+  "voc_years": ["5"],
   "train_split": "train",
   "val_split": "val",
   "obj_classes": [

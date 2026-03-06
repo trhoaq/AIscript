@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import gc
 from tqdm import tqdm
 import os
 from typing import List, Dict, Any
-from model.ssd_custom import SSDMobile
+from model.ssdlite_mobilenet import SSDMobile
 from model.utils import calculate_stats, compute_metrics # Import manual metrics
 from wandb_utils import is_wandb_active, log_wandb
 # Removed torchmetrics import
@@ -56,7 +57,7 @@ class DetectorTrainer:
         self.use_wandb = is_wandb_active()
 
         # If the main model is SSDMobile and pretrained_backbone is enabled, load its pretrained weights
-        from model.ssd_custom import SSDMobile
+        from model.ssdlite_mobilenet import SSDMobile
         if isinstance(self.model, SSDMobile) and self.model.pretrained_backbone and not self.model.backbone_has_weights_loaded:
             self.model.load_pretrained_weights(self.device)
         
@@ -79,14 +80,26 @@ class DetectorTrainer:
                 kd_feature_weight=config.get('kd_feature_weight', 1.0),
                 kd_logit_weight=config.get('kd_logit_weight', 1.0)
             )
+            student_feature_channels = getattr(self.model, "feature_channels", None)
             teacher_feature_channels = getattr(self.teacher_model, "feature_channels", None)
-            if isinstance(teacher_feature_channels, (list, tuple)) and len(teacher_feature_channels) > 0:
-                adapter_channels = [int(ch) for ch in teacher_feature_channels[:5]]
+            if (
+                isinstance(student_feature_channels, (list, tuple))
+                and isinstance(teacher_feature_channels, (list, tuple))
+                and len(student_feature_channels) > 0
+                and len(teacher_feature_channels) > 0
+            ):
+                num_pairs = min(len(student_feature_channels), len(teacher_feature_channels))
+                adapter_in_channels = [int(ch) for ch in teacher_feature_channels[:num_pairs]]
+                adapter_out_channels = [int(ch) for ch in student_feature_channels[:num_pairs]]
             else:
-                adapter_channels = [128, 128, 128, 128, 128]
+                adapter_in_channels = [128, 128, 128, 128, 128]
+                adapter_out_channels = [64, 64, 64, 64, 64]
 
             self.feature_adapters = nn.ModuleList(
-                [nn.Conv2d(in_ch, 64, kernel_size=1) for in_ch in adapter_channels]
+                [
+                    nn.Conv2d(in_ch, out_ch, kernel_size=1)
+                    for in_ch, out_ch in zip(adapter_in_channels, adapter_out_channels)
+                ]
             ).to(device)
             params_to_optimize.extend(self.feature_adapters.parameters())
 
@@ -289,6 +302,13 @@ class DetectorTrainer:
             }
             if self.feature_adapters:
                 self.interval_best_state['adapters_state_dict'] = {k: v.cpu().clone() for k, v in self.feature_adapters.state_dict().items()}
+
+        # Free temporary evaluation buffers between epochs.
+        all_preds.clear()
+        all_targets.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return avg_val_loss, mAP_0_5, precision_0_5, recall_0_5
 

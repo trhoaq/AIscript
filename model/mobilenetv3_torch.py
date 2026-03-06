@@ -1,3 +1,4 @@
+import gc
 from typing import List, Optional, Tuple, Type
 
 import torch
@@ -354,11 +355,12 @@ def load_pretrained_from_timm(
     copied = 0
     skipped = 0
     total = min(len(src_modules), len(dst_modules))
-    for i in range(total):
-        if _copy_module_weights(src_modules[i], dst_modules[i]):
-            copied += 1
-        else:
-            skipped += 1
+    with torch.no_grad():
+        for i in range(total):
+            if _copy_module_weights(src_modules[i], dst_modules[i]):
+                copied += 1
+            else:
+                skipped += 1
 
     if verbose:
         msg = (
@@ -366,5 +368,8 @@ def load_pretrained_from_timm(
             f"src={len(src_modules)} dst={len(dst_modules)}"
         )
         print(msg)
+
+    del src_model
+    gc.collect()
 
     return model

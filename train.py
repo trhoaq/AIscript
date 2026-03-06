@@ -1,5 +1,6 @@
 import torch
 import os
+import gc
 from typing import Any, Dict
 from torch.utils.data import DataLoader
 from config_utils import load_merged_config
@@ -9,38 +10,11 @@ from data_loader import (
     get_eval_transforms, 
     safe_collate_fn
 )
-from dataset import MosaicMixupDataset, get_coco_datasets, get_voc_datasets
+from dataset import MosaicMixupDataset, get_coco_datasets, get_voc_datasets, set_seed_everything
 from model.model import SSDGhost
-from model.ssd_custom import SSDMobile
+from model.ssdlite_mobilenet import SSDMobile
 from trainer import DetectorTrainer
 from wandb_utils import finish_wandb, init_wandb, log_wandb
-
-def load_student_weights(
-    model: SSDGhost,
-    checkpoint_path: str,
-    device: torch.device,
-    source_name: str = "student checkpoint",
-) -> None:
-    """
-    Load student checkpoint weights from local file in ./models.
-    Supports full checkpoint dict or raw state_dict.
-    """
-    if not checkpoint_path:
-        raise ValueError(f"{source_name} path is empty. Please provide a valid checkpoint path.")
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"{source_name} not found: {checkpoint_path}")
-
-    print(f"Loading {source_name} from: {checkpoint_path}")
-    checkpoint: Dict[str, Any] = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = checkpoint.get("model_state_dict", checkpoint)
-
-    try:
-        model.load_state_dict(state_dict, strict=True)
-        print(f"{source_name} loaded with strict=True.")
-    except RuntimeError as exc:
-        print(f"Warning: strict load failed for {source_name} ({exc}). Retrying with strict=False.")
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        print(f"{source_name} loaded with strict=False. missing={len(missing)} unexpected={len(unexpected)}")
 
 def load_teacher_weights(teacher: SSDMobile, checkpoint_path: str, device: torch.device) -> None:
     """
@@ -74,13 +48,24 @@ def main():
 
     init_wandb(config)
 
+    seed = int(config.get("seed", 42))
+    deterministic = bool(config.get("deterministic", False))
+    set_seed_everything(seed, deterministic=deterministic)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     img_size = config.get("img_size", 256)
     batch_size = config.get("batch_size", 32)
     num_workers = config.get("num_workers", 4)
-    student_width = float(config.get("student_width", 0.5))
-    use_pretrained_student_weights = bool(config.get("use_pretrained_student_weights", False))
-    student_pretrained_weights = config.get("student_pretrained_weights", "models/student_pretrained.pth")
+    student_width = float(config.get("student_width", 1.0))
+    use_pretrained_student_backbone = bool(
+        config.get("pretrain", config.get("use_pretrained_student_backbone", True))
+    )
+    student_pretrained_backbone_model = str(
+        config.get(
+            "student_pretrained_backbone_model",
+            config.get("student_imagenet_pretrained_model", "mobilenetv3_large_100"),
+        )
+    ).strip()
     load_student_checkpoint_enabled = bool(config.get("load_student_checkpoint", False))
     student_checkpoint = config.get("student_checkpoint", "models/student_checkpoint.pth")
     student_best_model_path = config.get("student_best_model_path", "models/best_model.pth")
@@ -89,6 +74,8 @@ def main():
     dataset_format = str(config.get("dataset_format", "voc")).strip().lower()
     voc_years = config.get("voc_years", ["2012"])
     voc_root = config.get("voc_root", "./data/VOC")
+    voc_auto_split = bool(config.get("voc_auto_split", True))
+    voc_val_ratio = float(config.get("voc_val_ratio", 0.2))
     coco_root = config.get("coco_root", "./data")
     coco_train_split = config.get("coco_train_split", config.get("train_split", "train2017"))
     coco_val_split = config.get("coco_val_split", config.get("val_split", "val2017"))
@@ -108,6 +95,9 @@ def main():
             train_split=config.get("train_split", "trainval"),
             val_split=config.get("val_split", "val"),
             obj_classes=config.get("obj_classes"),
+            auto_split=voc_auto_split,
+            split_seed=seed,
+            val_ratio=voc_val_ratio,
         )
     elif dataset_format == "coco":
         # COCO loader auto-detects directories with or without "_coco" suffix.
@@ -154,12 +144,12 @@ def main():
         num_classes=num_classes,
         width=student_width,
         img_size=img_size,
+        pretrained_backbone=use_pretrained_student_backbone,
+        pretrained_backbone_model_name=student_pretrained_backbone_model,
     )
     model.to(device) # Move model to device BEFORE profiling
-    if use_pretrained_student_weights:
-        load_student_weights(model, student_pretrained_weights, device, source_name="student pretrained weights")
-    if use_pretrained_student_weights and load_student_checkpoint_enabled:
-        print("Both student pretrained weights and student checkpoint are enabled. Checkpoint will override model weights.")
+    if use_pretrained_student_backbone:
+        model.load_pretrained_weights(device)
 
     # Calculate and log model complexity (total params and MAdds)
     try:
@@ -168,12 +158,16 @@ def main():
         # Create a dummy copy to avoid polluting the main model with hooks
         model_copy = copy.deepcopy(model).to(device)
         dummy_input = torch.randn(1, 3, img_size, img_size).to(device)
-        total_madds, total_params = profile(model_copy, inputs=(dummy_input,), verbose=False)
+        with torch.no_grad():
+            total_madds, total_params = profile(model_copy, inputs=(dummy_input,), verbose=False)
         print(f"\n--- Model Complexity ---")
         print(f"Total Parameters: {total_params / 1e6:.2f} M")
         print(f"Total MAdds (Giga): {total_madds / 1e9:.2f} G")
         print(f"------------------------\n")
-        del model_copy # Cleanup
+        del model_copy, dummy_input # Cleanup
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     except ImportError:
         print("Warning: 'thop' library not found. Skipping calculation of model parameters and MAdds.")
         print("Install with: pip install thop")
@@ -181,12 +175,15 @@ def main():
         print(f"Warning: Could not calculate model complexity: {e}")
 
 
-    # 4. Teacher Model (SSDLite MobileNetV3 from ssd_custom.py)
+    # 4. Teacher Model (SSDLite MobileNetV3 from ssdlite_mobilenet.py)
     teacher = None
     if use_kd:
         teacher_aspect_ratios = [[2], [2, 3], [2, 3], [2, 3], [2], [2]]
         teacher_checkpoint = config.get("teacher_checkpoint", "models/teacher_best_model.pth")
         use_pretrained_teacher_backbone = config.get("use_pretrained_teacher_backbone", True)
+        teacher_pretrained_backbone_model = str(
+            config.get("teacher_pretrained_backbone_model", "mobilenetv3_large_100")
+        ).strip()
         teacher = SSDMobile(
             num_classes=num_classes,
             aspect_ratios=teacher_aspect_ratios,
@@ -194,6 +191,7 @@ def main():
             s_min=0.07,
             s_max=0.95,
             pretrained_backbone=use_pretrained_teacher_backbone,
+            pretrained_backbone_model_name=teacher_pretrained_backbone_model,
         )
 
         if load_teacher_checkpoint_enabled:
@@ -238,7 +236,7 @@ def main():
             start_epoch = trainer.load_checkpoint(resume_checkpoint)
 
     # 6. Training Loop
-    print(f"Starting training GhostNet SSD 0.5x on {device}...")
+    print(f"Starting training SSDLite MobileNetV3 {student_width:.1f}x on {device}...")
     for epoch in range(start_epoch + 1, trainer_config['epochs'] + 1):
         train_loss = trainer.train_epoch(epoch)
         if train_loss is not None:

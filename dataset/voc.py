@@ -5,9 +5,18 @@ import torch
 from torch.utils.data import Dataset, ConcatDataset
 import albumentations as A
 import numpy as np # Move numpy import to the top
+from .utils import ensure_voc_train_val_split
 
 def _default_obj_classes():
     return ["background", "target"]
+
+
+def _find_image_path(images_path: str, img_id: str) -> str | None:
+    for ext in (".jpg", ".jpeg", ".png"):
+        candidate = os.path.join(images_path, f"{img_id}{ext}")
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 class PascalVOCDataset(Dataset):
     """
@@ -44,16 +53,18 @@ class PascalVOCDataset(Dataset):
                 valid_ids = [line.strip() for line in f if line.strip()]
             
             for img_id in valid_ids:
-                img_path = os.path.join(self.images_path, f'{img_id}.jpg')
+                img_path = _find_image_path(self.images_path, img_id)
                 ann_path = os.path.join(self.anno_path, f'{img_id}.xml')
-                if os.path.exists(img_path) and os.path.exists(ann_path):
+                if img_path and os.path.exists(ann_path):
                     self.ids.append(img_id)
         
         print(f"Found {len(self.ids)} valid samples in {image_set} set (Root: {root}).")
 
     def __getitem__(self, index):
         img_id = self.ids[index]
-        img_path = os.path.join(self.images_path, f'{img_id}.jpg')
+        img_path = _find_image_path(self.images_path, img_id)
+        if img_path is None:
+            return None, None
         ann_path = os.path.join(self.anno_path, f'{img_id}.xml')
 
         img = cv2.imread(img_path)
@@ -107,7 +118,19 @@ class PascalVOCDataset(Dataset):
     def __len__(self):
         return len(self.ids)
 
-def get_voc_datasets(voc_root, img_size, years, transform_train=None, transform_val=None, train_split="trainval", val_split="val", obj_classes=None):
+def get_voc_datasets(
+    voc_root,
+    img_size,
+    years,
+    transform_train=None,
+    transform_val=None,
+    train_split="trainval",
+    val_split="val",
+    obj_classes=None,
+    auto_split=True,
+    split_seed=42,
+    val_ratio=0.2,
+):
     """
     Helper function to get combined train and validation datasets for VOC.
     """
@@ -125,6 +148,15 @@ def get_voc_datasets(voc_root, img_size, years, transform_train=None, transform_
             if not os.path.exists(year_path):
                 print(f"Warning: VOC {year} folder not found in {voc_root}")
                 continue
+
+        if auto_split:
+            ensure_voc_train_val_split(
+                year_path,
+                train_split=train_split,
+                val_split=val_split,
+                val_ratio=val_ratio,
+                seed=split_seed,
+            )
         
         train_ds = PascalVOCDataset(year_path, image_set=train_split, transform=transform_train, obj_classes=obj_classes)
         val_ds = PascalVOCDataset(year_path, image_set=val_split, transform=transform_val, obj_classes=obj_classes)
@@ -135,6 +167,14 @@ def get_voc_datasets(voc_root, img_size, years, transform_train=None, transform_
     if not train_datasets:
         # Fallback: maybe voc_root IS the dataset folder
         print(f"No year-specific folders found, trying {voc_root} directly...")
+        if auto_split:
+            ensure_voc_train_val_split(
+                voc_root,
+                train_split=train_split,
+                val_split=val_split,
+                val_ratio=val_ratio,
+                seed=split_seed,
+            )
         train_ds = PascalVOCDataset(voc_root, image_set=train_split, transform=transform_train, obj_classes=obj_classes)
         val_ds = PascalVOCDataset(voc_root, image_set=val_split, transform=transform_val, obj_classes=obj_classes)
         if len(train_ds) > 0:
