@@ -1,5 +1,4 @@
 import argparse
-import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -28,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pre-nms-topk", type=int, default=None, help="Override pre-NMS top-k.")
     parser.add_argument("--max-detections", type=int, default=None, help="Override max detections per frame.")
     parser.add_argument("--line-thickness", type=int, default=2, help="Bounding box thickness.")
+    parser.add_argument("--log-interval-sec", type=float, default=1.0, help="Terminal benchmark log interval in seconds.")
     return parser.parse_args()
 
 
@@ -155,7 +155,6 @@ def _map_box_to_original(box: torch.Tensor, meta: Dict[str, float]) -> Tuple[int
 def _draw_detections(
     frame: np.ndarray,
     detections: torch.Tensor,
-    class_names: List[str],
     meta: Dict[str, float],
     line_thickness: int,
 ) -> None:
@@ -172,6 +171,39 @@ def _draw_detections(
         cx = (x1 + x2) // 2
         cy = (y1 + y2) // 2
         cv2.circle(frame, (cx, cy), radius=max(2, line_thickness * 2), color=(0, 255, 0), thickness=-1)
+
+
+def _print_benchmark_log(
+    total_frames: int,
+    total_elapsed: float,
+    window_frames: int,
+    window_elapsed: float,
+    window_pre_s: float,
+    window_inf_s: float,
+    window_post_s: float,
+    window_total_s: float,
+    window_det_count: int,
+) -> None:
+    if window_frames <= 0:
+        return
+
+    window_fps = window_frames / max(window_elapsed, 1e-6)
+    avg_fps = total_frames / max(total_elapsed, 1e-6)
+    avg_pre_ms = (window_pre_s / window_frames) * 1000.0
+    avg_inf_ms = (window_inf_s / window_frames) * 1000.0
+    avg_post_ms = (window_post_s / window_frames) * 1000.0
+    avg_total_ms = (window_total_s / window_frames) * 1000.0
+    avg_det_per_frame = window_det_count / max(window_frames, 1)
+
+    print(
+        "[Benchmark] "
+        f"frames={total_frames} "
+        f"window_fps={window_fps:.2f} "
+        f"avg_fps={avg_fps:.2f} "
+        f"latency_ms(total/pre/inf/post)="
+        f"{avg_total_ms:.2f}/{avg_pre_ms:.2f}/{avg_inf_ms:.2f}/{avg_post_ms:.2f} "
+        f"det_per_frame={avg_det_per_frame:.2f}"
+    )
 
 
 def _extract_logits_and_boxes(raw_outputs: Any, num_classes: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -212,8 +244,7 @@ def main() -> None:
     if "obj_classes" not in config or not isinstance(config["obj_classes"], list):
         raise ValueError("obj_classes is missing or invalid in merged config.")
 
-    class_names = config["obj_classes"]
-    num_classes = len(class_names)
+    num_classes = len(config["obj_classes"])
     fallback_img_size = int(config.get("img_size", 320))
 
     ov_model_path = Path(args.ov_model) if args.ov_model else _default_int8_path(args.model)
@@ -256,22 +287,54 @@ def main() -> None:
 
     print(f"Using OpenVINO model: {ov_model_path}")
     print("Runtime config: PERFORMANCE_HINT=LATENCY, INFERENCE_NUM_THREADS=2")
+    print(
+        f"Benchmark config: input_size={img_size}, score_thresh={score_thresh}, "
+        f"pre_nms_topk={pre_nms_topk}, max_detections={max_detections}, "
+        f"log_interval_sec={max(0.0, float(args.log_interval_sec)):.2f}"
+    )
+    cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cam_fps = float(cap.get(cv2.CAP_PROP_FPS))
+    print(f"Camera info: id={args.cam_id}, resolution={cam_w}x{cam_h}, reported_fps={cam_fps:.2f}")
     print("Press 'q' or ESC to exit.")
 
     window_name = f"OpenVINO INT8 ({args.model}) - cam {args.cam_id}"
-    prev_time = time.perf_counter()
+    run_start_time = time.perf_counter()
+    last_log_time = run_start_time
+    log_interval_sec = max(0.0, float(args.log_interval_sec))
+
+    total_frames = 0
+    total_pre_s = 0.0
+    total_inf_s = 0.0
+    total_post_s = 0.0
+    total_total_s = 0.0
+    total_det_count = 0
+
+    window_frames = 0
+    window_pre_s = 0.0
+    window_inf_s = 0.0
+    window_post_s = 0.0
+    window_total_s = 0.0
+    window_det_count = 0
 
     try:
         while True:
+            frame_start = time.perf_counter()
             ok, frame = cap.read()
             if not ok or frame is None:
                 print("Warning: Failed to read frame from camera. Exiting.")
                 break
 
+            pre_start = time.perf_counter()
             blob, meta = _preprocess_frame(frame, img_size)
+            pre_end = time.perf_counter()
+
+            inf_start = pre_end
             raw_outputs = compiled_model({input_name: blob})
             cls_logits_np, box_reg_np = _extract_logits_and_boxes(raw_outputs, num_classes)
+            inf_end = time.perf_counter()
 
+            post_start = inf_end
             cls_logits = torch.from_numpy(cls_logits_np)
             box_reg = torch.from_numpy(box_reg_np)
 
@@ -287,11 +350,32 @@ def main() -> None:
                 )
 
             detections = outputs[0] if outputs else torch.zeros((0, 6), dtype=torch.float32)
-            _draw_detections(frame, detections.cpu(), class_names, meta, args.line_thickness)
+            detections_cpu = detections.cpu()
+            _draw_detections(frame, detections_cpu, meta, args.line_thickness)
+            post_end = time.perf_counter()
 
-            now = time.perf_counter()
-            fps = 1.0 / max(now - prev_time, 1e-6)
-            prev_time = now
+            frame_end = time.perf_counter()
+            pre_s = pre_end - pre_start
+            inf_s = inf_end - inf_start
+            post_s = post_end - post_start
+            frame_total_s = frame_end - frame_start
+
+            det_count = int(detections_cpu.size(0))
+            total_frames += 1
+            total_pre_s += pre_s
+            total_inf_s += inf_s
+            total_post_s += post_s
+            total_total_s += frame_total_s
+            total_det_count += det_count
+
+            window_frames += 1
+            window_pre_s += pre_s
+            window_inf_s += inf_s
+            window_post_s += post_s
+            window_total_s += frame_total_s
+            window_det_count += det_count
+
+            fps = 1.0 / max(frame_total_s, 1e-6)
             cv2.putText(
                 frame,
                 f"FPS: {fps:.1f}",
@@ -307,7 +391,47 @@ def main() -> None:
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q") or key == 27:
                 break
+
+            now = time.perf_counter()
+            should_log = log_interval_sec == 0.0 or (now - last_log_time) >= log_interval_sec
+            if should_log:
+                _print_benchmark_log(
+                    total_frames=total_frames,
+                    total_elapsed=now - run_start_time,
+                    window_frames=window_frames,
+                    window_elapsed=now - last_log_time,
+                    window_pre_s=window_pre_s,
+                    window_inf_s=window_inf_s,
+                    window_post_s=window_post_s,
+                    window_total_s=window_total_s,
+                    window_det_count=window_det_count,
+                )
+                last_log_time = now
+                window_frames = 0
+                window_pre_s = 0.0
+                window_inf_s = 0.0
+                window_post_s = 0.0
+                window_total_s = 0.0
+                window_det_count = 0
     finally:
+        end_time = time.perf_counter()
+        elapsed = end_time - run_start_time
+        if total_frames > 0:
+            avg_fps = total_frames / max(elapsed, 1e-6)
+            avg_pre_ms = (total_pre_s / total_frames) * 1000.0
+            avg_inf_ms = (total_inf_s / total_frames) * 1000.0
+            avg_post_ms = (total_post_s / total_frames) * 1000.0
+            avg_total_ms = (total_total_s / total_frames) * 1000.0
+            avg_det = total_det_count / total_frames
+            print(
+                "[Summary] "
+                f"frames={total_frames} "
+                f"elapsed_sec={elapsed:.2f} "
+                f"avg_fps={avg_fps:.2f} "
+                f"avg_latency_ms(total/pre/inf/post)="
+                f"{avg_total_ms:.2f}/{avg_pre_ms:.2f}/{avg_inf_ms:.2f}/{avg_post_ms:.2f} "
+                f"avg_det_per_frame={avg_det:.2f}"
+            )
         cap.release()
         cv2.destroyAllWindows()
 
