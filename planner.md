@@ -23,17 +23,11 @@
   - [x] Implement the distillation process within the training loop.
 
 ## 3. Deployment & Optimization
-- [ ] **Export**: Create a script to export the trained model to ONNX format (opset >= 12).
-- [ ] **Quantization**:
-  - [ ] Use OpenVINO NNCF to perform Post-Training Quantization (PTQ).
-  - [ ] Calibrate using the KL-Divergence algorithm.
-- [ ] **Inference**:
-  - [ ] Write an inference script using OpenVINO.
-  - [ ] Configure the runtime for latency (`PerformanceMode::LATENCY`).
-  - [ ] Set inference threads to 2.
-
-## 4. Performance Tuning
-- [ ] **Benchmarking**:
-  - [ ] Profile the model at 256x256 resolution.
-  - [ ] Implement an FPS cap (15-20 FPS) to manage thermal throttling.
-  - [ ] Test long-term stability on the target Intel Pentium CPU.
+- [x] **Export**: Create a script to export the trained model to ONNX format (opset=18).
+- [x] **Quantization**:
+  - [x] Use OpenVINO NNCF to perform Post-Training Quantization (PTQ).
+  - [x] Calibrate using the KL-Divergence algorithm.
+- [x] **Inference**:
+  - [x] Write an inference script using OpenVINO.
+  - [x] Configure the runtime for latency (`PerformanceMode::LATENCY`).
+  - [x] Set inference threads to 2.

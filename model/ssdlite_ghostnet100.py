@@ -4,7 +4,7 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 
-from model.ghostnet import ghostnet
+from model.ghostnet import ghostnetv3
 from model.mobilenetv3_torch import load_pretrained_from_timm
 from model.ssdlite_mobilenet import ConvBNReLU6, DepthwiseSeparableConv, SSDMobile, SSDLiteHead
 
@@ -18,15 +18,15 @@ def _make_divisible(v: float, divisor: int = 4, min_value: Optional[int] = None)
     return int(new_v)
 
 
-class GhostNetSSDLiteBackbone(nn.Module):
-    """GhostNet backbone adapted for SSDLite feature extraction."""
+class GhostNetV3SSDLiteBackbone(nn.Module):
+    """GhostNetV3 backbone adapted for SSDLite feature extraction."""
 
     def __init__(self, width_mult: float = 1.0) -> None:
         super().__init__()
         self.width_mult = float(width_mult)
 
-        # Build local GhostNet classifier and reuse stem/blocks for detector features.
-        self.backbone_model = ghostnet(num_classes=1000, width=self.width_mult)
+        # Build local GhostNetV3 classifier and reuse stem/blocks for detector features.
+        self.backbone_model = ghostnetv3(width=self.width_mult)
 
         # Feature map selection points for 320x320 input:
         # - idx 6 -> 20x20 (112 channels for 1.0x)
@@ -67,7 +67,7 @@ class GhostNetSSDLiteBackbone(nn.Module):
                 high_level = x
 
         if low_level is None or high_level is None:
-            raise RuntimeError("Failed to extract GhostNet SSD feature maps.")
+            raise RuntimeError("Failed to extract GhostNetV3 SSD feature maps.")
 
         p3 = self.proj_low(low_level)
         p4 = self.proj_high(high_level)
@@ -79,9 +79,9 @@ class GhostNetSSDLiteBackbone(nn.Module):
         return [p3, p4, p5, p6, p7, p8]
 
 
-class SSDGhostNet100(SSDMobile):
+class SSDGhostNetV3(SSDMobile):
     """
-    SSDLite student model with GhostNet 1.0x backbone.
+    SSDLite student model with GhostNetV3 1.0x backbone.
     Reuses SSDMobile head/loss/post-process improvements from teacher architecture.
     """
 
@@ -95,7 +95,7 @@ class SSDGhostNet100(SSDMobile):
         score_thresh: float = 0.05,
         nms_thresh: float = 0.5,
         pretrained_backbone: bool = True,
-        pretrained_backbone_model_name: str = "ghostnet_100",
+        pretrained_backbone_model_name: str = "ghostnetv3_100.in1k",
         width_mult: float = 1.0,
     ) -> None:
         if aspect_ratios is None:
@@ -114,10 +114,10 @@ class SSDGhostNet100(SSDMobile):
             width_mult=1.0,
         )
 
-        self.backbone = GhostNetSSDLiteBackbone(width_mult=width_mult)
+        self.backbone = GhostNetV3SSDLiteBackbone(width_mult=width_mult)
         self.feature_channels = list(self.backbone.out_channels)
         self.head = SSDLiteHead(self.feature_channels, self.num_anchors, num_classes)
-        self.pretrained_backbone_model_name = str(pretrained_backbone_model_name).strip() or "ghostnet_100"
+        self.pretrained_backbone_model_name = str(pretrained_backbone_model_name).strip() or "ghostnetv3_100.in1k"
         self.backbone_has_weights_loaded = False
 
     def load_pretrained_weights(self, device: torch.device):
@@ -126,26 +126,30 @@ class SSDGhostNet100(SSDMobile):
             return
 
         if self.backbone_has_weights_loaded:
-            print("Pretrained weights already loaded for SSDGhostNet100 backbone.")
+            print("Pretrained weights already loaded for SSDGhostNetV3 backbone.")
             return
 
         model_name = self.pretrained_backbone_model_name
         print(
-            f"Loading GhostNet backbone ImageNet-1k pretrained weights "
+            f"Loading GhostNetV3 backbone ImageNet-1k pretrained weights "
             f"from timm model '{model_name}' to device: {device}"
         )
         try:
             with torch.no_grad():
                 self.backbone.load_imagenet_pretrained(model_name)
             self.backbone_has_weights_loaded = True
-            print("Successfully loaded GhostNet backbone from timm ImageNet-1k weights.")
+            print("Successfully loaded GhostNetV3 backbone from timm ImageNet-1k weights.")
         except ImportError:
             print("Failed to import timm. Install with: pip install timm")
             self.backbone_has_weights_loaded = False
         except Exception as e:
-            print(f"Failed to load GhostNet timm ImageNet-1k weights: {e}")
+            print(f"Failed to load GhostNetV3 timm ImageNet-1k weights: {e}")
             self.backbone_has_weights_loaded = False
         finally:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+
+class SSDGhostNet100(SSDGhostNetV3):
+    """Backward-compatible alias."""

@@ -8,5 +8,8 @@ numpy>=1.20.0
 timm>=0.4.12 
 thop
 wandb
+onnx>=1.16.0; python_version < "3.13"
+openvino>=2024.0.0; python_version < "3.13"
+nncf>=2.10.0; python_version < "3.13"
 
 

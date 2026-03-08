@@ -10,6 +10,44 @@ from model.utils import calculate_stats, compute_metrics # Import manual metrics
 from wandb_utils import is_wandb_active, log_wandb
 # Removed torchmetrics import
 
+
+def _torch_load_checkpoint(path: str, map_location):
+    """
+    PyTorch 2.6-compatible checkpoint loading:
+    - Prefer weights_only=True for safety.
+    - Allowlist numpy scalar used by some scheduler/optimizer states.
+    - Fallback to weights_only=False only when needed for trusted checkpoints.
+    """
+    safe_globals = []
+    try:
+        import numpy as np
+
+        safe_globals.append(np.core.multiarray.scalar)
+    except Exception:
+        pass
+
+    try:
+        if safe_globals and hasattr(torch.serialization, "safe_globals"):
+            with torch.serialization.safe_globals(safe_globals):
+                return torch.load(path, map_location=map_location, weights_only=True)
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        # Older torch without weights_only kwarg.
+        return torch.load(path, map_location=map_location)
+    except Exception as exc:
+        msg = str(exc)
+        if "WeightsUnpickler error" in msg or "Unsupported global" in msg:
+            print(
+                "weights_only=True could not deserialize this checkpoint. "
+                "Falling back to weights_only=False for trusted local file."
+            )
+            try:
+                return torch.load(path, map_location=map_location, weights_only=False)
+            except TypeError:
+                return torch.load(path, map_location=map_location)
+        raise
+
+
 class DistillationLoss(nn.Module):
     """
     Distillation loss module.
@@ -368,22 +406,72 @@ class DetectorTrainer:
             return 0
 
         print(f"Loading checkpoint from {path}...")
-        checkpoint = torch.load(path, map_location=self.device)
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if 'scheduler_state_dict' in checkpoint:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-        self.best_val_map05 = checkpoint.get('best_val_map05', -1.0)
-        
-        if self.feature_adapters and 'adapters_state_dict' in checkpoint:
-            self.feature_adapters.load_state_dict(checkpoint['adapters_state_dict'])
-            
-        raw_epoch = checkpoint.get('epoch', 0)
+        checkpoint = _torch_load_checkpoint(path, map_location=self.device)
+        if not isinstance(checkpoint, dict):
+            print("Warning: Invalid checkpoint format. Starting from scratch.")
+            return 0
+
+        # Support both full trainer checkpoints and raw model state_dict files.
+        model_state = checkpoint.get("model_state_dict")
+        if model_state is None and checkpoint:
+            if all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+                model_state = checkpoint
+        if not isinstance(model_state, dict):
+            print("Warning: No valid model_state_dict found in checkpoint. Starting from scratch.")
+            return 0
+
+        # Remove DataParallel prefix if present.
+        if any(k.startswith("module.") for k in model_state.keys()):
+            model_state = {k.replace("module.", "", 1): v for k, v in model_state.items()}
+
+        full_resume = True
         try:
-            start_epoch = int(raw_epoch) if raw_epoch is not None else 0
-        except (TypeError, ValueError):
-            start_epoch = 0
-        print(f"Checkpoint loaded. Resuming from epoch {start_epoch + 1}.")
-        return start_epoch
+            self.model.load_state_dict(model_state, strict=True)
+        except RuntimeError as exc:
+            full_resume = False
+            print(f"Warning: strict model checkpoint load failed ({exc}). Trying strict=False for warm-start.")
+            missing, unexpected = self.model.load_state_dict(model_state, strict=False)
+            total_expected = len(self.model.state_dict())
+            matched = total_expected - len(missing)
+            matched_ratio = matched / max(1, total_expected)
+            print(
+                f"Warm-start checkpoint load: matched={matched}/{total_expected} "
+                f"({matched_ratio:.1%}), missing={len(missing)}, unexpected={len(unexpected)}"
+            )
+            if matched_ratio < 0.5:
+                print("Checkpoint is too incompatible with current model. Starting from scratch.")
+                return 0
+
+        if self.feature_adapters and 'adapters_state_dict' in checkpoint:
+            try:
+                if full_resume:
+                    self.feature_adapters.load_state_dict(checkpoint['adapters_state_dict'], strict=True)
+                else:
+                    self.feature_adapters.load_state_dict(checkpoint['adapters_state_dict'], strict=False)
+            except Exception as exc:
+                print(f"Warning: failed to load adapter state_dict ({exc}).")
+
+        if full_resume:
+            try:
+                if 'optimizer_state_dict' in checkpoint:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except Exception as exc:
+                print(f"Warning: failed to load optimizer state_dict ({exc}).")
+            try:
+                if 'scheduler_state_dict' in checkpoint:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            except Exception as exc:
+                print(f"Warning: failed to load scheduler state_dict ({exc}).")
+
+            self.best_val_map05 = checkpoint.get('best_val_map05', -1.0)
+
+            raw_epoch = checkpoint.get('epoch', 0)
+            try:
+                start_epoch = int(raw_epoch) if raw_epoch is not None else 0
+            except (TypeError, ValueError):
+                start_epoch = 0
+            print(f"Checkpoint loaded. Resuming from epoch {start_epoch + 1}.")
+            return start_epoch
+
+        print("Checkpoint loaded as warm-start only. Optimizer/scheduler/epoch reset to initial state.")
+        return 0

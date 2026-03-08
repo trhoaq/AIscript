@@ -12,10 +12,44 @@ from data_loader import (
     safe_collate_fn
 )
 from dataset import MosaicMixupDataset, get_coco_datasets, get_voc_datasets, set_seed_everything
-from model.ssdlite_ghostnet100 import SSDGhostNet100
+from model.ssdlite_ghostnet100 import SSDGhostNetV3
 from model.ssdlite_mobilenet import SSDMobile
 from trainer import DetectorTrainer
 from wandb_utils import finish_wandb, init_wandb, log_wandb
+
+
+def _torch_load_checkpoint(path: str, map_location):
+    """
+    PyTorch 2.6-compatible checkpoint loading for trusted training artifacts.
+    """
+    safe_globals = []
+    try:
+        import numpy as np
+
+        safe_globals.append(np.core.multiarray.scalar)
+    except Exception:
+        pass
+
+    try:
+        if safe_globals and hasattr(torch.serialization, "safe_globals"):
+            with torch.serialization.safe_globals(safe_globals):
+                return torch.load(path, map_location=map_location, weights_only=True)
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+    except Exception as exc:
+        msg = str(exc)
+        if "WeightsUnpickler error" in msg or "Unsupported global" in msg:
+            print(
+                "weights_only=True could not deserialize this checkpoint. "
+                "Falling back to weights_only=False for trusted local file."
+            )
+            try:
+                return torch.load(path, map_location=map_location, weights_only=False)
+            except TypeError:
+                return torch.load(path, map_location=map_location)
+        raise
+
 
 def load_teacher_weights(teacher: SSDMobile, checkpoint_path: str, device: torch.device) -> None:
     """
@@ -28,7 +62,7 @@ def load_teacher_weights(teacher: SSDMobile, checkpoint_path: str, device: torch
         raise FileNotFoundError(f"Teacher checkpoint not found: {checkpoint_path}")
 
     print(f"Loading teacher checkpoint from: {checkpoint_path}")
-    checkpoint: Dict[str, Any] = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint: Dict[str, Any] = _torch_load_checkpoint(checkpoint_path, map_location=device)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
 
     try:
@@ -85,7 +119,7 @@ def main():
     # Hard-configured ImageNet-1k pretrained backbones from timm.
     use_pretrained_student_backbone = True
     use_pretrained_teacher_backbone = True
-    student_pretrained_backbone_model = "ghostnet_100"
+    student_pretrained_backbone_model = "ghostnetv3_100.in1k"
     teacher_pretrained_backbone_model = "mobilenetv3_large_100"
     load_student_checkpoint_enabled = bool(config.get("load_student_checkpoint", False))
     student_checkpoint = config.get("student_checkpoint", "models/student_checkpoint.pth")
@@ -167,7 +201,7 @@ def main():
 
     # 3. Model
     num_classes = len(config["obj_classes"])
-    model = SSDGhostNet100(
+    model = SSDGhostNetV3(
         num_classes=num_classes,
         width_mult=student_width,
         img_size=img_size,
@@ -273,7 +307,7 @@ def main():
         print("No student checkpoint found. Starting from scratch.")
 
     # 6. Training Loop
-    print(f"Starting training SSDLite GhostNet {student_width:.1f}x on {device}...")
+    print(f"Starting training SSDLite GhostNetV3 {student_width:.1f}x on {device}...")
     for epoch in range(start_epoch + 1, trainer_config['epochs'] + 1):
         train_loss = trainer.train_epoch(epoch)
         if train_loss is not None:

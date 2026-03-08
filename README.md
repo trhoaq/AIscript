@@ -116,15 +116,33 @@ py train.py
 ```
 This script will train the `SSDGhost` model, guided by the `SSDMobile` teacher model, and save its checkpoints.
 
+### 4. Deploy with OpenVINO (Export -> PTQ -> Webcam Inference)
+
+1. Export PyTorch checkpoint to ONNX (opset 18):
+
+```bash
+venv\Scripts\python.exe export_onnx.py --model student
+```
+
+2. Quantize ONNX to INT8 OpenVINO IR with NNCF PTQ (KL/histogram calibration):
+
+```bash
+venv\Scripts\python.exe quantize_openvino.py --model student
+```
+
+3. Run webcam inference (`cam id=0`) with OpenVINO runtime in latency mode and 2 inference threads:
+
+```bash
+venv\Scripts\python.exe inference.py --model student --cam-id 0
+```
+
+Use `--model teacher` to run the teacher variant.
+
 ## Future Work (from planner.md)
 
 -   **Model Architecture:**
     -   Experiment with FPN channel sizes (48 or 64).
     -   Evaluate removing anchors from the smallest feature map (stride 8).
--   **Deployment & Optimization:**
-    -   Export to ONNX.
-    -   Post-Training Quantization with OpenVINO NNCF.
-    -   Inference script using OpenVINO.
 -   **Performance Tuning:**
     -   Benchmarking and profiling.
     -   Implement FPS cap.
