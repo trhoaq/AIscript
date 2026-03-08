@@ -14,6 +14,7 @@ from model.ssdlite_mobilenet import SSDMobile
 
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+_FALLBACK_BY_ORDER_WARNED = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,13 +22,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="config/config.json", help="Path to main config file.")
     parser.add_argument("--model", choices=["student", "teacher"], default="student", help="Model variant.")
     parser.add_argument("--ov-model", default=None, help="Path to OpenVINO IR .xml model. Default: models/openvino/{model}_int8.xml")
-    parser.add_argument("--cam-id", type=int, default=0, help="Camera device id.")
+    parser.add_argument("--cam-id", type=str, default=0, help="Camera device id.")
     parser.add_argument("--device", default="CPU", help="OpenVINO device for runtime.")
     parser.add_argument("--score-thresh", type=float, default=None, help="Override score threshold.")
     parser.add_argument("--pre-nms-topk", type=int, default=None, help="Override pre-NMS top-k.")
     parser.add_argument("--max-detections", type=int, default=None, help="Override max detections per frame.")
     parser.add_argument("--line-thickness", type=int, default=2, help="Bounding box thickness.")
     parser.add_argument("--log-interval-sec", type=float, default=1.0, help="Terminal benchmark log interval in seconds.")
+    parser.add_argument("--no-display", action="store_true", help="Disable OpenCV window and run terminal-only benchmark.")
+    parser.add_argument("--max-frames", type=int, default=0, help="Stop after N frames (0 means run until interrupted).")
     return parser.parse_args()
 
 
@@ -207,36 +210,147 @@ def _print_benchmark_log(
 
 
 def _extract_logits_and_boxes(raw_outputs: Any, num_classes: int) -> Tuple[np.ndarray, np.ndarray]:
-    arrays: List[np.ndarray] = []
+    named_arrays: List[Tuple[str, np.ndarray]] = []
 
-    if isinstance(raw_outputs, dict):
-        for value in raw_outputs.values():
-            arrays.append(np.array(value))
-    elif isinstance(raw_outputs, (list, tuple)):
-        for value in raw_outputs:
-            arrays.append(np.array(value))
-    else:
-        arrays.append(np.array(raw_outputs))
+    def _key_to_name(key: Any) -> str:
+        if key is None:
+            return ""
+        if isinstance(key, str):
+            return key
+        try:
+            if hasattr(key, "get_any_name"):
+                name = key.get_any_name()
+                if name:
+                    return str(name)
+        except Exception:
+            pass
+        try:
+            if hasattr(key, "get_names"):
+                names = list(key.get_names())
+                if names:
+                    return str(names[0])
+        except Exception:
+            pass
+        return str(key)
+
+    def _as_numpy(value: Any) -> np.ndarray:
+        if isinstance(value, np.ndarray):
+            return value
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().numpy()
+        try:
+            return np.asarray(value)
+        except Exception:
+            return np.array(value, dtype=object)
+
+    def _collect(value: Any, name_hint: str = "") -> None:
+        if value is None:
+            return
+
+        if isinstance(value, dict):
+            for k, v in value.items():
+                _collect(v, _key_to_name(k))
+            return
+
+        if hasattr(value, "items") and callable(getattr(value, "items")) and not isinstance(value, np.ndarray):
+            try:
+                items = list(value.items())
+                if items:
+                    for k, v in items:
+                        _collect(v, _key_to_name(k))
+                    return
+            except Exception:
+                pass
+
+        if isinstance(value, (list, tuple)):
+            for idx, v in enumerate(value):
+                _collect(v, f"{name_hint}[{idx}]")
+            return
+
+        if hasattr(value, "values") and callable(getattr(value, "values")) and not isinstance(value, np.ndarray):
+            try:
+                vals = list(value.values())
+                if vals:
+                    for idx, v in enumerate(vals):
+                        _collect(v, f"{name_hint}[{idx}]")
+                    return
+            except Exception:
+                pass
+
+        arr = _as_numpy(value)
+        # Some OpenVINO wrappers may produce object arrays (e.g. sequence outputs).
+        if arr.dtype == object:
+            unpacked = False
+            for item in arr.ravel().tolist():
+                if isinstance(item, (np.ndarray, list, tuple, dict)) or hasattr(item, "shape"):
+                    _collect(item, name_hint)
+                    unpacked = True
+            if unpacked:
+                return
+        named_arrays.append((name_hint, arr))
+
+    _collect(raw_outputs, "output")
 
     cls_logits = None
     box_reg = None
 
-    for arr in arrays:
-        if arr.ndim == 3 and arr.shape[-1] == num_classes:
+    normalized_outputs: List[Tuple[str, np.ndarray]] = []
+    for name, arr in named_arrays:
+        if arr.ndim == 2:
+            arr = arr[None, ...]
+
+        if arr.ndim == 3 and arr.shape[1] == num_classes:
+            arr = np.transpose(arr, (0, 2, 1))
+        elif arr.ndim == 3 and arr.shape[1] == 4 and arr.shape[-1] != 4:
+            arr = np.transpose(arr, (0, 2, 1))
+
+        if arr.ndim == 3:
+            normalized_outputs.append((name, arr.astype(np.float32)))
+
+    # 1) Prefer output names when available.
+    for name, arr in normalized_outputs:
+        lname = name.lower()
+        if cls_logits is None and arr.shape[-1] == num_classes and any(t in lname for t in ("cls", "class", "logit", "conf", "score")):
             cls_logits = arr
-        elif arr.ndim == 3 and arr.shape[-1] == 4:
+        if box_reg is None and arr.shape[-1] == 4 and any(t in lname for t in ("bbox", "box", "reg", "loc")):
             box_reg = arr
 
+    if (cls_logits is None or box_reg is None) and len(normalized_outputs) >= 2:
+        if normalized_outputs[0][1].shape[-1] == 4 and normalized_outputs[1][1].shape[-1] == 4:
+            global _FALLBACK_BY_ORDER_WARNED
+            if not _FALLBACK_BY_ORDER_WARNED:
+                print("\n[CẢNH BÁO] Không thể phân biệt cls_logits và bbox_regression do shape giống nhau.")
+                print("[CẢNH BÁO] Đang gán cứng thứ tự index: [0]=cls, [1]=bbox.\n")
+                _FALLBACK_BY_ORDER_WARNED = True
+            return normalized_outputs[0][1], normalized_outputs[1][1]
+
+    # 2) Use shape heuristics when unambiguous.
+    if cls_logits is None:
+        cls_candidates = [arr for _, arr in normalized_outputs if arr.shape[-1] == num_classes]
+        if num_classes != 4 and cls_candidates:
+            cls_logits = cls_candidates[0]
+
+    if box_reg is None:
+        reg_candidates = [arr for _, arr in normalized_outputs if arr.shape[-1] == 4]
+        if reg_candidates:
+            if cls_logits is None:
+                box_reg = reg_candidates[0]
+            else:
+                for cand in reg_candidates:
+                    if cand is not cls_logits:
+                        box_reg = cand
+                        break
+                if box_reg is None:
+                    box_reg = reg_candidates[0]
+
     if cls_logits is None or box_reg is None:
-        shapes = [tuple(a.shape) for a in arrays]
+        shapes = [(name, tuple(arr.shape)) for name, arr in normalized_outputs]
         raise RuntimeError(
             "Cannot identify OpenVINO outputs for cls_logits and bbox_regression. "
             f"Output shapes: {shapes}"
         )
-
-    return cls_logits.astype(np.float32), box_reg.astype(np.float32)
-
-
+    return cls_logits, box_reg
+    
 def main() -> None:
     args = parse_args()
     config = load_merged_config(args.config)
@@ -281,6 +395,10 @@ def main() -> None:
     pre_nms_topk = int(args.pre_nms_topk) if args.pre_nms_topk is not None else int(config.get("eval_pre_nms_topk", 400))
     max_detections = int(args.max_detections) if args.max_detections is not None else int(config.get("eval_max_detections", 100))
 
+    if args.cam_id == "0":
+        args.cam_id = int(args.cam_id)
+    else:
+        args.cam_id = str(args.cam_id)
     cap = cv2.VideoCapture(args.cam_id)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open camera with id={args.cam_id}")
@@ -296,9 +414,17 @@ def main() -> None:
     cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cam_fps = float(cap.get(cv2.CAP_PROP_FPS))
     print(f"Camera info: id={args.cam_id}, resolution={cam_w}x{cam_h}, reported_fps={cam_fps:.2f}")
+    print(f"Display: {'disabled' if args.no_display else 'enabled'}")
     print("Press 'q' or ESC to exit.")
 
     window_name = f"OpenVINO INT8 ({args.model}) - cam {args.cam_id}"
+    display_enabled = not args.no_display
+    if display_enabled:
+        try:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        except cv2.error as exc:
+            print(f"Warning: OpenCV GUI is unavailable. Falling back to no-display mode. detail={exc}")
+            display_enabled = False
     run_start_time = time.perf_counter()
     last_log_time = run_start_time
     log_interval_sec = max(0.0, float(args.log_interval_sec))
@@ -387,10 +513,15 @@ def main() -> None:
                 cv2.LINE_AA,
             )
 
-            cv2.imshow(window_name, frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q") or key == 27:
-                break
+            if display_enabled:
+                try:
+                    cv2.imshow(window_name, frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("q") or key == 27:
+                        break
+                except cv2.error as exc:
+                    print(f"Warning: OpenCV GUI call failed. Switching to no-display mode. detail={exc}")
+                    display_enabled = False
 
             now = time.perf_counter()
             should_log = log_interval_sec == 0.0 or (now - last_log_time) >= log_interval_sec
@@ -413,6 +544,10 @@ def main() -> None:
                 window_post_s = 0.0
                 window_total_s = 0.0
                 window_det_count = 0
+
+            if args.max_frames > 0 and total_frames >= int(args.max_frames):
+                print(f"Reached max_frames={args.max_frames}. Stopping.")
+                break
     finally:
         end_time = time.perf_counter()
         elapsed = end_time - run_start_time
@@ -433,7 +568,10 @@ def main() -> None:
                 f"avg_det_per_frame={avg_det:.2f}"
             )
         cap.release()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error as exc:
+            print(f"Warning: cv2.destroyAllWindows() is unavailable in this environment. detail={exc}")
 
 
 if __name__ == "__main__":
