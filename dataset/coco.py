@@ -22,7 +22,7 @@ def _load_default_obj_classes() -> List[str]:
 
 def _normalize_split_name(split: str) -> str:
     normalized = split[:-5] if split.endswith("_coco") else split
-    aliases = {"train": "train2017", "val": "val2017"}
+    aliases = {"train": "train", "val": "val"}
     return aliases.get(normalized, normalized)
 
 
@@ -83,8 +83,6 @@ def _resolve_annotation_path(root: str, split: str) -> str:
             file_candidates.append(candidate)
     dir_candidates = [
         os.path.join(root, "annotations"),
-        os.path.join(root, "annotations_trainval2017"),
-        os.path.join(root, "annotations_trainval2017_coco"),
         root,
     ]
 
@@ -111,7 +109,7 @@ class COCODataset(Dataset):
     def __init__(
         self,
         root: str,
-        split: str = "train2017",
+        split: str = "train",
         mode: str = "RGB",
         transform=None,
         obj_classes: Optional[List[str]] = None,
