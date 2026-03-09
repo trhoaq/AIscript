@@ -300,7 +300,7 @@ class SSDMobile(nn.Module):
             best_gt_iou[best_prior_idx] = 1.0
             best_gt_idx[best_prior_idx] = torch.arange(best_prior_idx.size(0), device=device)
 
-            positives = best_gt_iou >= 0.5
+            positives = best_gt_iou >= 0.6
             num_pos = positives.sum().item()
             if num_pos == 0:
                 continue
@@ -317,7 +317,7 @@ class SSDMobile(nn.Module):
 
             neg_mask = ~positives
             neg_loss = conf_loss_all[neg_mask]
-            num_neg_to_mine = min(neg_mask.sum().item(), 3 * num_pos)
+            num_neg_to_mine = min(neg_mask.sum().item(), 6 * num_pos)
 
             cls_loss_pos = conf_loss_all[positives].sum()
             cls_loss_neg, _ = neg_loss.sort(descending=True)
@@ -339,6 +339,8 @@ class SSDMobile(nn.Module):
         pre_nms_topk: Optional[int] = None,
         max_detections: Optional[int] = None,
     ):
+        from model.utils import batched_nms
+        
         if score_thresh is None:
             score_thresh = self.score_thresh
         if pre_nms_topk is None:
@@ -347,47 +349,53 @@ class SSDMobile(nn.Module):
             max_detections = 100
 
         device = cls_logits.device
-        probs = F.softmax(cls_logits, dim=-1)
+        num_classes = self.num_classes
+        
+        # 1. Convert logits to probabilities
+        probs = F.softmax(cls_logits, dim=-1) # (B, N, C)
+        
         outputs = []
-
         for b in range(cls_logits.size(0)):
-            boxes = self._decode(box_reg[b], priors)
-            scores = probs[b]
-            out_boxes: List[torch.Tensor] = []
-            out_scores: List[torch.Tensor] = []
-            out_labels: List[torch.Tensor] = []
-
-            for c in range(1, self.num_classes):
-                cls_scores = scores[:, c]
-                keep = cls_scores > score_thresh
-                if keep.sum() == 0:
-                    continue
-
-                boxes_c = boxes[keep]
-                scores_c = cls_scores[keep]
-
-                if pre_nms_topk > 0 and scores_c.numel() > pre_nms_topk:
-                    topk_idx = torch.topk(scores_c, k=pre_nms_topk).indices
-                    boxes_c = boxes_c[topk_idx]
-                    scores_c = scores_c[topk_idx]
-
-                keep_idx = nms(boxes_c, scores_c, self.nms_thresh)
-                out_boxes.append(boxes_c[keep_idx])
-                out_scores.append(scores_c[keep_idx])
-                out_labels.append(torch.full((keep_idx.numel(),), c, device=device, dtype=torch.long))
-
-            if out_boxes:
-                boxes_cat = torch.cat(out_boxes, dim=0)
-                scores_cat = torch.cat(out_scores, dim=0).unsqueeze(1)
-                labels_cat = torch.cat(out_labels, dim=0).unsqueeze(1).float()
-                preds = torch.cat([boxes_cat, scores_cat, labels_cat], dim=1)
-
-                if max_detections > 0 and preds.size(0) > max_detections:
-                    top_idx = torch.topk(preds[:, 4], k=max_detections).indices
-                    preds = preds[top_idx]
-
-                outputs.append(preds)
-            else:
+            # 2. Decode all boxes for this batch element
+            boxes = self._decode(box_reg[b], priors) # (N, 4)
+            scores = probs[b] # (N, C)
+            
+            # 3. Filter boxes by score threshold (ignoring background class 0)
+            # We only consider the best class for each anchor to keep it simple and efficient
+            conf, labels = scores[:, 1:].max(dim=1)
+            labels = labels + 1 # Adjust back to [1, num_classes-1]
+            
+            keep = conf > score_thresh
+            if not keep.any():
                 outputs.append(torch.zeros((0, 6), device=device))
+                continue
+            
+            boxes = boxes[keep]
+            conf = conf[keep]
+            labels = labels[keep]
+            
+            # 4. Limit to pre_nms_topk
+            if pre_nms_topk > 0 and boxes.size(0) > pre_nms_topk:
+                topk_idx = torch.topk(conf, k=pre_nms_topk).indices
+                boxes = boxes[topk_idx]
+                conf = conf[topk_idx]
+                labels = labels[topk_idx]
+            
+            # 5. Apply Batched NMS (class-aware NMS)
+            keep_idx = batched_nms(boxes, conf, labels, self.nms_thresh)
+            
+            boxes = boxes[keep_idx]
+            conf = conf[keep_idx]
+            labels = labels[keep_idx]
+            
+            # 6. Combine into final detections [x1, y1, x2, y2, score, label]
+            preds = torch.cat([boxes, conf.unsqueeze(1), labels.unsqueeze(1).float()], dim=1)
+            
+            # 7. Final limit to max_detections
+            if max_detections > 0 and preds.size(0) > max_detections:
+                top_idx = torch.topk(preds[:, 4], k=max_detections).indices
+                preds = preds[top_idx]
+                
+            outputs.append(preds)
 
         return outputs

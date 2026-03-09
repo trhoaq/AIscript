@@ -37,41 +37,34 @@ def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
     return inter / (union + 1e-16)
 
 
+import torchvision.ops as ops
+
 def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torch.Tensor:
-    """Non-maximum suppression implemented with native PyTorch ops."""
+    """Non-maximum suppression using torchvision ops."""
     if boxes.numel() == 0:
-        return boxes.new_zeros((0,), dtype=torch.long)
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+    return ops.nms(boxes, scores, iou_threshold)
 
-    x1 = boxes[:, 0]
-    y1 = boxes[:, 1]
-    x2 = boxes[:, 2]
-    y2 = boxes[:, 3]
-    areas = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
-    order = scores.argsort(descending=True)
-    keep: List[int] = []
-
-    while order.numel() > 0:
-        i = int(order[0])
-        keep.append(i)
-        if order.numel() == 1:
-            break
-
-        rest = order[1:]
-        xx1 = torch.maximum(x1[i], x1[rest])
-        yy1 = torch.maximum(y1[i], y1[rest])
-        xx2 = torch.minimum(x2[i], x2[rest])
-        yy2 = torch.minimum(y2[i], y2[rest])
-
-        w = (xx2 - xx1).clamp(min=0)
-        h = (yy2 - yy1).clamp(min=0)
-        inter = w * h
-        union = areas[i] + areas[rest] - inter
-        iou = inter / (union + 1e-16)
-
-        remain = torch.where(iou <= iou_threshold)[0]
-        order = rest[remain]
-
-    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
+def batched_nms(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    idxs: torch.Tensor,
+    iou_threshold: float,
+) -> torch.Tensor:
+    """
+    Performs non-maximum suppression in a batched fashion.
+    Each index value corresponds to a category, and NMS will not suppress boxes
+    from different categories.
+    """
+    if boxes.numel() == 0:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+    
+    # Strategy: offset boxes by category to avoid overlaps between different classes
+    # This is standard practice in object detection frameworks (e.g., Detectron2, YOLOv5+)
+    max_coordinate = boxes.max()
+    offsets = idxs.to(boxes) * (max_coordinate + 1)
+    boxes_for_nms = boxes + offsets[:, None]
+    return ops.nms(boxes_for_nms, scores, iou_threshold)
 
 def calculate_stats(preds: List[torch.Tensor], targets: List[dict], iou_threshold: float = 0.5):
     """
@@ -94,67 +87,75 @@ def calculate_stats(preds: List[torch.Tensor], targets: List[dict], iou_threshol
     
     # 2. Pre-index Ground Truths by label and image_idx on CPU
     gt_indexed = {} # {label: {img_idx: boxes}}
-    unique_labels = set()
+    all_gt_labels = set()
     for i, t in enumerate(targets):
         l_np = t['labels'].cpu().numpy()
         b_np = t['boxes'].cpu().numpy()
         for label in np.unique(l_np):
-            unique_labels.add(int(label))
-            if label not in gt_indexed: gt_indexed[label] = {}
-            gt_indexed[label][i] = b_np[l_np == label]
+            label_int = int(label)
+            all_gt_labels.add(label_int)
+            if label_int not in gt_indexed: gt_indexed[label_int] = {}
+            gt_indexed[label_int][i] = b_np[l_np == label]
+
+    # Include all labels from predictions and GTs
+    all_possible_labels = all_gt_labels.union(set(all_preds[:, 5].unique().long().tolist()))
 
     stats = {}
-    for label in unique_labels:
+    for label in all_possible_labels:
         # 3. Filter predictions for this class
         cls_mask = all_preds[:, 5] == label
         cls_preds = all_preds[cls_mask]
-        if cls_preds.shape[0] == 0: continue
+        
+        # Count total GTs
+        total_gt = sum(len(v) for v in gt_indexed.get(label, {}).values())
+        
+        if cls_preds.shape[0] == 0:
+            if total_gt > 0:
+                # No predictions for this label, but GTs exist
+                stats[label] = {'tp': [], 'conf': [], 'total_gt': total_gt}
+            continue
         
         # Sort by confidence
         cls_preds = cls_preds[torch.argsort(cls_preds[:, 4], descending=True)]
         
-        # Count total GTs
-        total_gt = sum(len(v) for v in gt_indexed.get(label, {}).values())
-        if total_gt == 0: continue
-
         # 4. Matching logic (Sequential but fast on CPU/NumPy)
         tp = np.zeros(len(cls_preds))
         conf = cls_preds[:, 4].numpy()
         
-        # Track matched GTs per image
-        matched_gts = {img_idx: np.zeros(len(boxes), dtype=bool) 
-                       for img_idx, boxes in gt_indexed.get(label, {}).items()}
+        if total_gt > 0:
+            # Track matched GTs per image
+            matched_gts = {img_idx: np.zeros(len(boxes), dtype=bool) 
+                           for img_idx, boxes in gt_indexed.get(label, {}).items()}
 
-        preds_np = cls_preds.numpy() # [x1, y1, x2, y2, score, label, img_idx]
-        
-        for i in range(len(preds_np)):
-            img_idx = int(preds_np[i, 6])
-            if img_idx not in matched_gts:
-                continue
+            preds_np = cls_preds.numpy() # [x1, y1, x2, y2, score, label, img_idx]
+            
+            for i in range(len(preds_np)):
+                img_idx = int(preds_np[i, 6])
+                if img_idx not in matched_gts:
+                    continue
+                    
+                pred_box = preds_np[i, :4]
+                gt_boxes = gt_indexed[label][img_idx]
                 
-            pred_box = preds_np[i, :4]
-            gt_boxes = gt_indexed[label][img_idx]
-            
-            # Fast IoU calculation for one pred box vs all GT boxes in that image
-            # Manual IoU to avoid torch overhead
-            ixmin = np.maximum(gt_boxes[:, 0], pred_box[0])
-            iymin = np.maximum(gt_boxes[:, 1], pred_box[1])
-            ixmax = np.minimum(gt_boxes[:, 2], pred_box[2])
-            iymax = np.minimum(gt_boxes[:, 3], pred_box[3])
-            iw = np.maximum(ixmax - ixmin, 0.)
-            ih = np.maximum(iymax - iymin, 0.)
-            inters = iw * ih
-            
-            uni = ((pred_box[2] - pred_box[0]) * (pred_box[3] - pred_box[1]) +
-                   (gt_boxes[:, 2] - gt_boxes[:, 0]) * (gt_boxes[:, 3] - gt_boxes[:, 1]) -
-                   inters)
-            
-            overlaps = inters / uni
-            best_idx = np.argmax(overlaps)
-            if overlaps[best_idx] > iou_threshold:
-                if not matched_gts[img_idx][best_idx]:
-                    tp[i] = 1
-                    matched_gts[img_idx][best_idx] = True
+                # Fast IoU calculation
+                ixmin = np.maximum(gt_boxes[:, 0], pred_box[0])
+                iymin = np.maximum(gt_boxes[:, 1], pred_box[1])
+                ixmax = np.minimum(gt_boxes[:, 2], pred_box[2])
+                iymax = np.minimum(gt_boxes[:, 3], pred_box[3])
+                iw = np.maximum(ixmax - ixmin, 0.)
+                ih = np.maximum(iymax - iymin, 0.)
+                inters = iw * ih
+                
+                uni = ((pred_box[2] - pred_box[0]) * (pred_box[3] - pred_box[1]) +
+                       (gt_boxes[:, 2] - gt_boxes[:, 0]) * (gt_boxes[:, 3] - gt_boxes[:, 1]) -
+                       inters)
+                
+                overlaps = inters / (uni + 1e-16)
+                best_idx = np.argmax(overlaps)
+                if overlaps[best_idx] > iou_threshold:
+                    if not matched_gts[img_idx][best_idx]:
+                        tp[i] = 1
+                        matched_gts[img_idx][best_idx] = True
         
         stats[label] = {'tp': tp.tolist(), 'conf': conf.tolist(), 'total_gt': total_gt}
 

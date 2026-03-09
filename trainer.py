@@ -201,7 +201,7 @@ class DetectorTrainer:
             gt_loss_dict = self.model.multibox_loss(student_logits, student_regs, targets, priors)
             
             # Ground truth loss
-            loss = gt_loss_dict["bbox_regression"] + gt_loss_dict["classification"]
+            loss = gt_loss_dict["bbox_regression"] + 2.0 * gt_loss_dict["classification"]
 
             # Knowledge Distillation Loss
             if self.teacher_model and self.distill_criterion and self.feature_adapters:
