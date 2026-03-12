@@ -13,6 +13,7 @@ from data_loader import (
 )
 from dataset import MosaicMixupDataset, get_coco_datasets, get_voc_datasets, set_seed_everything
 from model.ssdlite_ghostnet100 import SSDGhostNetV3
+from model.model_cnn import SSDCNNStudent
 from model.ssdlite_mobilenet import SSDMobile
 from trainer import DetectorTrainer
 from wandb_utils import finish_wandb, init_wandb, log_wandb
@@ -116,8 +117,9 @@ def main():
     batch_size = config.get("batch_size", 32)
     num_workers = config.get("num_workers", 4)
     student_width = float(config.get("student_width", 1.0))
+    student_model_kind = str(config.get("student_model", "ghostnet")).strip().lower()
     # Hard-configured ImageNet-1k pretrained backbones from timm.
-    use_pretrained_student_backbone = True
+    use_pretrained_student_backbone = bool(config.get("student_pretrained_backbone", True))
     use_pretrained_teacher_backbone = True
     student_pretrained_backbone_model = "ghostnetv3_100.in1k"
     teacher_pretrained_backbone_model = "mobilenetv3_large_100"
@@ -201,13 +203,30 @@ def main():
 
     # 3. Model
     num_classes = len(config["obj_classes"])
-    model = SSDGhostNetV3(
-        num_classes=num_classes,
-        width_mult=student_width,
-        img_size=img_size,
-        pretrained_backbone=use_pretrained_student_backbone,
-        pretrained_backbone_model_name=student_pretrained_backbone_model,
-    )
+    if student_model_kind == "cnn":
+        use_pretrained_student_backbone = False
+        model = SSDCNNStudent(
+            num_classes=num_classes,
+            img_size=img_size,
+            aspect_ratios=config.get("student_cnn_aspect_ratios"),
+            base_channels=config.get("student_cnn_base_channels"),
+            fpn_channels=int(config.get("student_cnn_fpn_channels", 128)),
+            fc_dim=int(config.get("student_cnn_fc_dim", 256)),
+            stem_channels=config.get("student_cnn_stem_channels"),
+            head_dropout=float(config.get("student_cnn_head_dropout", 0.1)),
+            s_min=float(config.get("student_cnn_s_min", 0.07)),
+            s_max=float(config.get("student_cnn_s_max", 0.95)),
+            score_thresh=float(config.get("score_thresh", 0.05)),
+            nms_thresh=float(config.get("nms_thresh", 0.5)),
+        )
+    else:
+        model = SSDGhostNetV3(
+            num_classes=num_classes,
+            width_mult=student_width,
+            img_size=img_size,
+            pretrained_backbone=use_pretrained_student_backbone,
+            pretrained_backbone_model_name=student_pretrained_backbone_model,
+        )
     model.to(device) # Move model to device BEFORE profiling
     if use_pretrained_student_backbone:
         model.load_pretrained_weights(device)

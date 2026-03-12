@@ -27,7 +27,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _default_onnx_path(model_kind: str) -> Path:
+def _default_onnx_path(model_kind: str, config: Optional[Dict[str, Any]] = None) -> Path:
+    if model_kind == "student" and config:
+        student_model_kind = str(config.get("student_model", "")).strip().lower()
+        if student_model_kind == "cnn":
+            cnn_path = Path("models") / "openvino" / "student_cnn_fp32.onnx"
+            if cnn_path.exists():
+                return cnn_path
     return Path("models") / "openvino" / f"{model_kind}_fp32.onnx"
 
 
@@ -198,12 +204,28 @@ def _get_input_name(ov_model) -> str:
     return "images"
 
 
+def _resolve_model_input_size(ov_model, fallback_size: int) -> int:
+    try:
+        # Use partial_shape to avoid exception on dynamic batch size.
+        # In OpenVINO Python API, Input.shape calls get_shape() which throws if dynamic.
+        ps = ov_model.input(0).get_partial_shape()
+        if ps.rank.is_static and ps.rank.get_length() == 4:
+            if ps[2].is_static and ps[3].is_static:
+                h = ps[2].get_length()
+                w = ps[3].get_length()
+                if h > 0 and w > 0 and h == w:
+                    return int(h)
+    except Exception:
+        pass
+    return fallback_size
+
+
 def main() -> None:
     args = parse_args()
     config = load_merged_config(args.config)
-    img_size = int(config.get("img_size", 320))
+    fallback_img_size = int(config.get("img_size", 320))
 
-    onnx_path = Path(args.onnx) if args.onnx else _default_onnx_path(args.model)
+    onnx_path = Path(args.onnx) if args.onnx else _default_onnx_path(args.model, config)
     onnx_path = onnx_path.resolve()
     if not onnx_path.exists():
         raise FileNotFoundError(
@@ -219,6 +241,13 @@ def main() -> None:
             "OpenVINO/NNCF is required for PTQ. Install in a supported Python environment (typically <= 3.12)."
         ) from exc
 
+    core = ov.Core()
+    ov_model = core.read_model(str(onnx_path))
+
+    img_size = _resolve_model_input_size(ov_model, fallback_img_size)
+    if img_size != fallback_img_size:
+        print(f"Warning: Model input size ({img_size}) differs from config ({fallback_img_size}). Using {img_size}.")
+
     image_paths = _gather_calibration_images(config, args.calib_dir, args.subset_size)
     calibration_inputs: List[np.ndarray] = []
     for path in image_paths:
@@ -232,8 +261,6 @@ def main() -> None:
 
     print(f"Loaded {len(calibration_inputs)} calibration samples.")
 
-    core = ov.Core()
-    ov_model = core.read_model(str(onnx_path))
     input_name = _get_input_name(ov_model)
 
     calibration_dataset = nncf.Dataset(

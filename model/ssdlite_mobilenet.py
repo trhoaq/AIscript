@@ -300,7 +300,7 @@ class SSDMobile(nn.Module):
             best_gt_iou[best_prior_idx] = 1.0
             best_gt_idx[best_prior_idx] = torch.arange(best_prior_idx.size(0), device=device)
 
-            positives = best_gt_iou >= 0.6
+            positives = best_gt_iou >= 0.5
             num_pos = positives.sum().item()
             if num_pos == 0:
                 continue
@@ -317,7 +317,7 @@ class SSDMobile(nn.Module):
 
             neg_mask = ~positives
             neg_loss = conf_loss_all[neg_mask]
-            num_neg_to_mine = min(neg_mask.sum().item(), 6 * num_pos)
+            num_neg_to_mine = min(neg_mask.sum().item(), 3 * num_pos)
 
             cls_loss_pos = conf_loss_all[positives].sum()
             cls_loss_neg, _ = neg_loss.sort(descending=True)

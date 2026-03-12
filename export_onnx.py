@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from config_utils import load_merged_config
 from model.ssdlite_ghostnet100 import SSDGhostNetV3
+from model.model_cnn import SSDCNNStudent
 from model.ssdlite_mobilenet import SSDMobile
 
 
@@ -89,13 +90,30 @@ def _build_model(config: Dict[str, Any], model_kind: str):
     img_size = int(config.get("img_size", 320))
 
     if model_kind == "student":
-        width_mult = float(config.get("student_width", 1.0))
-        model = SSDGhostNetV3(
-            num_classes=num_classes,
-            width_mult=width_mult,
-            img_size=img_size,
-            pretrained_backbone=False,
-        )
+        student_model_kind = str(config.get("student_model", "ghostnet")).strip().lower()
+        if student_model_kind == "cnn":
+            model = SSDCNNStudent(
+                num_classes=num_classes,
+                img_size=img_size,
+                aspect_ratios=config.get("student_cnn_aspect_ratios"),
+                base_channels=config.get("student_cnn_base_channels"),
+                fpn_channels=int(config.get("student_cnn_fpn_channels", 128)),
+                fc_dim=int(config.get("student_cnn_fc_dim", 256)),
+                stem_channels=config.get("student_cnn_stem_channels"),
+                head_dropout=float(config.get("student_cnn_head_dropout", 0.1)),
+                s_min=float(config.get("student_cnn_s_min", 0.07)),
+                s_max=float(config.get("student_cnn_s_max", 0.95)),
+                score_thresh=float(config.get("score_thresh", 0.05)),
+                nms_thresh=float(config.get("nms_thresh", 0.5)),
+            )
+        else:
+            width_mult = float(config.get("student_width", 1.0))
+            model = SSDGhostNetV3(
+                num_classes=num_classes,
+                width_mult=width_mult,
+                img_size=img_size,
+                pretrained_backbone=False,
+            )
         ckpt_path = str(config.get("student_best_model_path", "")).strip()
     else:
         teacher_aspect_ratios = [[2], [2, 3], [2, 3], [2, 3], [2], [2]]

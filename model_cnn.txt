@@ -1,0 +1,58 @@
+Model: SSDCNNStudent (CNN + FPN + SSDLite Head)
+
+Input:
+- Image tensor: 3 x 512 x 512
+
+Backbone: SimpleCNNBackbone
+- Preprocessing Stages:
+  - S1: ConvBNReLU(3 -> s1, k=3, s=2)
+  - S2: ConvBNReLU(s1 -> s2, k=3, s=2)
+- C3 (stride 8):
+  - ConvBNReLU(s2 -> c1, k=3, s=2)
+  - ResidualBlock(c1)
+- C4 (stride 16):
+  - ConvBNReLU(c1 -> c2, k=3, s=2)
+  - ResidualBlock(c2)
+- C5 (stride 32):
+  - ConvBNReLU(c2 -> c3, k=3, s=2)
+  - ResidualBlock(c3)
+  - SpatialPyramidPooling(c3) [maxpool k=3/5/7, stride=2], concat + 1x1 conv + BN + ReLU
+
+FPN: SimpleFPN
+- Lateral 1x1 convs on C3/C4/C5 -> P3/P4/P5
+- Top-down: P5 -> P4 -> P3 (nearest upsample + add)
+- 3x3 conv on P3/P4/P5
+- Extra levels:
+  - P6 = Conv3x3(stride=2) on P5
+  - P7 = Conv3x3(stride=2) on ReLU(P6)
+
+Context Gate (GlobalContextGate):
+- GAP on C5 -> FC(ReLU) -> FC -> sigmoid gate (size = FPN channels)
+- Gate applied to each P level
+- BatchNorm after gate per P-level
+
+Head: SSDLiteHeadWithDropout (Multi-head)
+- Dropout2d on each FPN feature
+- Classification head per FPN level
+- Regression head per FPN level
+- Outputs:
+  - cls_logits: [B, N, num_classes]
+  - bbox_regression: [B, N, 4]
+
+Post-process:
+- Softmax scores
+- Score thresholding
+- pre_nms_topk
+- Batched NMS (class-aware)
+- max_detections
+
+Key Config Params:
+- student_model = "cnn"
+- student_cnn_stem_channels = [16, 32]
+- student_cnn_base_channels = [32, 64, 128]
+- student_cnn_fpn_channels = 128
+- student_cnn_fc_dim = 256
+- student_cnn_head_dropout = 0.1
+- student_cnn_aspect_ratios = [[2], [2,3], [2,3], [2], [2]]
+- student_cnn_s_min = 0.07
+- student_cnn_s_max = 0.95

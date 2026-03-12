@@ -9,6 +9,7 @@ import torch
 
 from config_utils import load_merged_config
 from model.ssdlite_ghostnet100 import SSDGhostNetV3
+from model.model_cnn import SSDCNNStudent
 from model.ssdlite_mobilenet import SSDMobile
 
 
@@ -35,18 +36,34 @@ def _default_int8_path(model_kind: str) -> Path:
     return Path("models") / "openvino" / f"{model_kind}" /f"{model_kind}_int8.xml"
 
 
-def _build_postprocess_model(config: Dict[str, Any], model_kind: str):
+def _build_postprocess_model(config: Dict[str, Any], model_kind: str, img_size: int):
     num_classes = len(config["obj_classes"])
-    img_size = int(config.get("img_size", 320))
 
     if model_kind == "student":
-        width_mult = float(config.get("student_width", 1.0))
-        model = SSDGhostNetV3(
-            num_classes=num_classes,
-            width_mult=width_mult,
-            img_size=img_size,
-            pretrained_backbone=False,
-        )
+        student_model_kind = str(config.get("student_model", "ghostnet")).strip().lower()
+        if student_model_kind == "cnn":
+            model = SSDCNNStudent(
+                num_classes=num_classes,
+                img_size=img_size,
+                aspect_ratios=config.get("student_cnn_aspect_ratios"),
+                base_channels=config.get("student_cnn_base_channels"),
+                fpn_channels=int(config.get("student_cnn_fpn_channels", 128)),
+                fc_dim=int(config.get("student_cnn_fc_dim", 256)),
+                stem_channels=config.get("student_cnn_stem_channels"),
+                head_dropout=float(config.get("student_cnn_head_dropout", 0.1)),
+                s_min=float(config.get("student_cnn_s_min", 0.07)),
+                s_max=float(config.get("student_cnn_s_max", 0.95)),
+                score_thresh=float(config.get("score_thresh", 0.05)),
+                nms_thresh=float(config.get("nms_thresh", 0.5)),
+            )
+        else:
+            width_mult = float(config.get("student_width", 1.0))
+            model = SSDGhostNetV3(
+                num_classes=num_classes,
+                width_mult=width_mult,
+                img_size=img_size,
+                pretrained_backbone=False,
+            )
     else:
         teacher_aspect_ratios = [[2], [2, 3], [2, 3], [2, 3], [2], [2]]
         model = SSDMobile(
@@ -72,12 +89,17 @@ def _prepare_priors(post_model, img_size: int) -> torch.Tensor:
 
 def _resolve_model_input_size(compiled_model, fallback_size: int) -> int:
     try:
-        shape = list(compiled_model.input(0).shape)
+        # Use partial_shape to avoid exception on dynamic batch size.
+        # In OpenVINO Python API, Input.shape calls get_shape() which throws if dynamic.
+        ps = compiled_model.input(0).get_partial_shape()
+        if ps.rank.is_static and ps.rank.get_length() == 4:
+            if ps[2].is_static and ps[3].is_static:
+                h = ps[2].get_length()
+                w = ps[3].get_length()
+                if h > 0 and w > 0 and h == w:
+                    return int(h)
     except Exception:
-        return fallback_size
-
-    if len(shape) == 4 and int(shape[2]) > 0 and int(shape[3]) > 0 and int(shape[2]) == int(shape[3]):
-        return int(shape[2])
+        pass
     return fallback_size
 
 
@@ -312,7 +334,10 @@ def main() -> None:
     input_name = _get_input_name(compiled_model)
 
     img_size = _resolve_model_input_size(compiled_model, fallback_img_size)
-    post_model = _build_postprocess_model(config, args.model)
+    if img_size != fallback_img_size:
+        print(f"Warning: Model input size ({img_size}) differs from config ({fallback_img_size}). Using {img_size}.")
+
+    post_model = _build_postprocess_model(config, args.model, img_size)
     priors = _prepare_priors(post_model, img_size)
 
     score_thresh = float(args.score_thresh) if args.score_thresh is not None else float(config.get("score_thresh", 0.5))
