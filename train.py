@@ -13,7 +13,7 @@ from data_loader import (
 )
 from dataset import MosaicMixupDataset, get_coco_datasets, get_voc_datasets, set_seed_everything
 from model.ssdlite_ghostnet100 import SSDGhostNetV3
-from model.model_cnn import SSDCNNStudent
+from model.model_cnn import AnchorFreeCNNStudent
 from model.ssdlite_mobilenet import SSDMobile
 from trainer import DetectorTrainer
 from wandb_utils import finish_wandb, init_wandb, log_wandb
@@ -205,15 +205,18 @@ def main():
     num_classes = len(config["obj_classes"])
     if student_model_kind == "cnn":
         use_pretrained_student_backbone = False
-        model = SSDCNNStudent(
+        model = AnchorFreeCNNStudent(
             num_classes=num_classes,
             img_size=img_size,
-            aspect_ratios=config.get("student_cnn_aspect_ratios"),
             base_channels=config.get("student_cnn_base_channels"),
             fpn_channels=int(config.get("student_cnn_fpn_channels", 128)),
             fc_dim=int(config.get("student_cnn_fc_dim", 256)),
             stem_channels=config.get("student_cnn_stem_channels"),
             head_dropout=float(config.get("student_cnn_head_dropout", 0.1)),
+            fcos_strides=config.get("student_cnn_fcos_strides"),
+            fcos_ranges=config.get("student_cnn_fcos_ranges"),
+            head_num_convs=int(config.get("student_cnn_head_num_convs", 3)),
+            head_depthwise=bool(config.get("student_cnn_head_depthwise", True)),
             s_min=float(config.get("student_cnn_s_min", 0.07)),
             s_max=float(config.get("student_cnn_s_max", 0.95)),
             score_thresh=float(config.get("score_thresh", 0.05)),
@@ -240,9 +243,11 @@ def main():
         dummy_input = torch.randn(1, 3, img_size, img_size).to(device)
         with torch.no_grad():
             total_madds, total_params = profile(model_copy, inputs=(dummy_input,), verbose=False)
+        total_flops = total_madds * 2
         print(f"\n--- Model Complexity ---")
         print(f"Total Parameters: {total_params / 1e6:.2f} M")
         print(f"Total MAdds (Giga): {total_madds / 1e9:.2f} G")
+        print(f"Total FLOPs (Giga): {total_flops / 1e9:.2f} G")
         print(f"------------------------\n")
         del model_copy, dummy_input # Cleanup
         gc.collect()

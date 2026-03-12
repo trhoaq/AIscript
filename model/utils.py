@@ -37,6 +37,37 @@ def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
     return inter / (union + 1e-16)
 
 
+def generalized_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """
+    Generalized IoU for aligned boxes (N,4) vs (N,4).
+    Boxes are in (xmin, ymin, xmax, ymax).
+    Returns (N,) GIoU values.
+    """
+    if boxes1.numel() == 0:
+        return boxes1.new_zeros((0,))
+
+    # Intersection
+    lt = torch.maximum(boxes1[:, :2], boxes2[:, :2])
+    rb = torch.minimum(boxes1[:, 2:], boxes2[:, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, 0] * wh[:, 1]
+
+    # Areas
+    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
+    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+    union = area1 + area2 - inter
+    iou = inter / (union + 1e-16)
+
+    # Enclosing box
+    enclose_lt = torch.minimum(boxes1[:, :2], boxes2[:, :2])
+    enclose_rb = torch.maximum(boxes1[:, 2:], boxes2[:, 2:])
+    enclose_wh = (enclose_rb - enclose_lt).clamp(min=0)
+    enclose_area = enclose_wh[:, 0] * enclose_wh[:, 1]
+
+    giou = iou - (enclose_area - union) / (enclose_area + 1e-16)
+    return giou
+
+
 import torchvision.ops as ops
 
 def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torch.Tensor:

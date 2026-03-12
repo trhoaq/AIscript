@@ -1,0 +1,161 @@
+_wandb:
+    value:
+        cli_version: 0.25.1
+        e:
+            7tgrtybvq0cuixbaogqj3kgshe4b8sxa:
+                codePath: train.py
+                codePathLocal: train.py
+                cpu_count: 2
+                cpu_count_logical: 4
+                disk:
+                    /:
+                        total: "41941987328"
+                        used: "29591367680"
+                email: hoangphi.wordcite.zaun@gmail.com
+                executable: D:\AIscript\venv\Scripts\python.exe
+                git:
+                    commit: 53e8c4dd04a34e23cf6686aa1cfb830af4131d76
+                    remote: https://github.com/trhoaq/AIscript
+                host: DESKTOP-LGUHJ8Q
+                memory:
+                    total: "12769886208"
+                os: Windows-10-10.0.19045-SP0
+                program: D:\AIscript\train.py
+                python: CPython 3.13.5
+                root: D:\AIscript
+                startedAt: "2026-03-12T07:13:26.601013Z"
+                writerId: 7tgrtybvq0cuixbaogqj3kgshe4b8sxa
+        m: []
+        python_version: 3.13.5
+        t:
+            "1":
+                - 1
+                - 41
+                - 49
+                - 63
+                - 80
+            "2":
+                - 1
+                - 41
+                - 49
+                - 63
+                - 80
+            "3":
+                - 13
+                - 16
+            "4": 3.13.5
+            "5": 0.25.1
+            "8":
+                - 3
+            "12": 0.25.1
+            "13": windows-amd64
+batch_size:
+    value: 8
+coco_root:
+    value: ./data/coco
+coco_train_split:
+    value: train
+coco_val_split:
+    value: val
+dataset_format:
+    value: coco
+deterministic:
+    value: false
+early_stopping_patience:
+    value: 10
+epochs:
+    value: 100
+eval_interval:
+    value: 1
+eval_max_detections:
+    value: 100
+eval_pre_nms_topk:
+    value: 400
+eval_score_thresh:
+    value: 0.5
+img_size:
+    value: 512
+kd_teacher_model_path:
+    value: models/teacher/best_model.pth
+load_student_checkpoint:
+    value: false
+load_teacher_checkpoint:
+    value: true
+lr:
+    value: 0.0001
+nms_thresh:
+    value: 0.6
+num_workers:
+    value: 4
+obj_classes:
+    value:
+        - background
+        - target
+p_mixup:
+    value: 0
+p_mosaic:
+    value: 0.5
+score_thresh:
+    value: 0.5
+seed:
+    value: 42
+student_best_model_path:
+    value: models/kd_student/best_model.pth
+student_checkpoint:
+    value: models/kd_student/best_model.pth
+student_cnn_aspect_ratios:
+    value:
+        - - 2
+        - - 2
+          - 3
+        - - 2
+          - 3
+        - - 2
+        - - 2
+student_cnn_base_channels:
+    value:
+        - 32
+        - 64
+        - 128
+student_cnn_fc_dim:
+    value: 256
+student_cnn_fpn_channels:
+    value: 128
+student_cnn_head_dropout:
+    value: 0.1
+student_cnn_s_max:
+    value: 0.95
+student_cnn_s_min:
+    value: 0.07
+student_cnn_stem_channels:
+    value:
+        - 16
+        - 32
+student_final_model_path:
+    value: models/kd_student/final_model.pth
+student_interval_checkpoint_dir:
+    value: models/kd_student/cp
+student_model:
+    value: cnn
+student_pretrained_backbone:
+    value: true
+student_width:
+    value: 1
+teacher_best_model_path:
+    value: models/teacher/best_model.pth
+teacher_final_model_path:
+    value: models/teacher/final_model.pth
+teacher_interval_checkpoint_dir:
+    value: models/teacher/cp
+use_kd:
+    value: false
+voc_auto_split:
+    value: true
+voc_val_ratio:
+    value: 0.2
+wandb_project:
+    value: AIscript-Object-Detection
+wandb_run_name:
+    value: GhostNet-SSD-v1
+weight_decay:
+    value: 0.001

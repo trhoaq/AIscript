@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from config_utils import load_merged_config
 from model.ssdlite_ghostnet100 import SSDGhostNetV3
-from model.model_cnn import SSDCNNStudent
+from model.model_cnn import AnchorFreeCNNStudent
 from model.ssdlite_mobilenet import SSDMobile
 
 
@@ -19,7 +19,11 @@ class ONNXExportWrapper(nn.Module):
         self.model = model
 
     def forward(self, images: torch.Tensor):
-        cls_logits, box_reg, _ = self.model.forward_logits(images)
+        outputs = self.model.forward_logits(images)
+        if len(outputs) == 4:
+            cls_logits, box_reg, centerness, _ = outputs
+            return cls_logits, box_reg, centerness
+        cls_logits, box_reg, _ = outputs
         return cls_logits, box_reg
 
 
@@ -92,15 +96,18 @@ def _build_model(config: Dict[str, Any], model_kind: str):
     if model_kind == "student":
         student_model_kind = str(config.get("student_model", "ghostnet")).strip().lower()
         if student_model_kind == "cnn":
-            model = SSDCNNStudent(
+            model = AnchorFreeCNNStudent(
                 num_classes=num_classes,
                 img_size=img_size,
-                aspect_ratios=config.get("student_cnn_aspect_ratios"),
                 base_channels=config.get("student_cnn_base_channels"),
                 fpn_channels=int(config.get("student_cnn_fpn_channels", 128)),
                 fc_dim=int(config.get("student_cnn_fc_dim", 256)),
                 stem_channels=config.get("student_cnn_stem_channels"),
                 head_dropout=float(config.get("student_cnn_head_dropout", 0.1)),
+                fcos_strides=config.get("student_cnn_fcos_strides"),
+                fcos_ranges=config.get("student_cnn_fcos_ranges"),
+                head_num_convs=int(config.get("student_cnn_head_num_convs", 3)),
+                head_depthwise=bool(config.get("student_cnn_head_depthwise", True)),
                 s_min=float(config.get("student_cnn_s_min", 0.07)),
                 s_max=float(config.get("student_cnn_s_max", 0.95)),
                 score_thresh=float(config.get("score_thresh", 0.05)),
@@ -204,6 +211,22 @@ def main() -> None:
     export_model = ONNXExportWrapper(model).to(device)
     export_model.eval()
 
+    if getattr(model, "anchor_free", False):
+        output_names = ["cls_logits", "bbox_regression", "centerness"]
+        dynamic_axes = {
+            "images": {0: "batch"},
+            "cls_logits": {0: "batch"},
+            "bbox_regression": {0: "batch"},
+            "centerness": {0: "batch"},
+        }
+    else:
+        output_names = ["cls_logits", "bbox_regression"]
+        dynamic_axes = {
+            "images": {0: "batch"},
+            "cls_logits": {0: "batch"},
+            "bbox_regression": {0: "batch"},
+        }
+
     torch.onnx.export(
         export_model,
         dummy_input,
@@ -212,12 +235,8 @@ def main() -> None:
         do_constant_folding=True,
         opset_version=args.opset,
         input_names=["images"],
-        output_names=["cls_logits", "bbox_regression"],
-        dynamic_axes={
-            "images": {0: "batch"},
-            "cls_logits": {0: "batch"},
-            "bbox_regression": {0: "batch"},
-        },
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
     )
 
     print(f"Exported ONNX model to: {output_path}")

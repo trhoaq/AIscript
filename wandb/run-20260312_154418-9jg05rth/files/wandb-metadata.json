@@ -1,0 +1,28 @@
+{
+  "os": "Windows-10-10.0.19045-SP0",
+  "python": "CPython 3.13.5",
+  "startedAt": "2026-03-12T08:44:18.118871Z",
+  "program": "D:\\AIscript\\train.py",
+  "codePath": "train.py",
+  "codePathLocal": "train.py",
+  "git": {
+    "remote": "https://github.com/trhoaq/AIscript",
+    "commit": "53e8c4dd04a34e23cf6686aa1cfb830af4131d76"
+  },
+  "email": "hoangphi.wordcite.zaun@gmail.com",
+  "root": "D:\\AIscript",
+  "host": "DESKTOP-LGUHJ8Q",
+  "executable": "D:\\AIscript\\venv\\Scripts\\python.exe",
+  "cpu_count": 2,
+  "cpu_count_logical": 4,
+  "disk": {
+    "/": {
+      "total": "41941987328",
+      "used": "28174106624"
+    }
+  },
+  "memory": {
+    "total": "12769886208"
+  },
+  "writerId": "rvybu9gauiqrqgz86168m37lw0klm7nm"
+}

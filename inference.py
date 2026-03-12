@@ -9,7 +9,7 @@ import torch
 
 from config_utils import load_merged_config
 from model.ssdlite_ghostnet100 import SSDGhostNetV3
-from model.model_cnn import SSDCNNStudent
+from model.model_cnn import AnchorFreeCNNStudent
 from model.ssdlite_mobilenet import SSDMobile
 
 
@@ -42,15 +42,18 @@ def _build_postprocess_model(config: Dict[str, Any], model_kind: str, img_size: 
     if model_kind == "student":
         student_model_kind = str(config.get("student_model", "ghostnet")).strip().lower()
         if student_model_kind == "cnn":
-            model = SSDCNNStudent(
+            model = AnchorFreeCNNStudent(
                 num_classes=num_classes,
                 img_size=img_size,
-                aspect_ratios=config.get("student_cnn_aspect_ratios"),
                 base_channels=config.get("student_cnn_base_channels"),
                 fpn_channels=int(config.get("student_cnn_fpn_channels", 128)),
                 fc_dim=int(config.get("student_cnn_fc_dim", 256)),
                 stem_channels=config.get("student_cnn_stem_channels"),
                 head_dropout=float(config.get("student_cnn_head_dropout", 0.1)),
+                fcos_strides=config.get("student_cnn_fcos_strides"),
+                fcos_ranges=config.get("student_cnn_fcos_ranges"),
+                head_num_convs=int(config.get("student_cnn_head_num_convs", 3)),
+                head_depthwise=bool(config.get("student_cnn_head_depthwise", True)),
                 s_min=float(config.get("student_cnn_s_min", 0.07)),
                 s_max=float(config.get("student_cnn_s_max", 0.95)),
                 score_thresh=float(config.get("score_thresh", 0.05)),
@@ -79,7 +82,9 @@ def _build_postprocess_model(config: Dict[str, Any], model_kind: str, img_size: 
     return model
 
 
-def _prepare_priors(post_model, img_size: int) -> torch.Tensor:
+def _prepare_priors(post_model, img_size: int) -> Optional[torch.Tensor]:
+    if getattr(post_model, "anchor_free", False):
+        return None
     dummy = torch.zeros((1, 3, img_size, img_size), dtype=torch.float32)
     with torch.no_grad():
         _, _, feats = post_model.forward_logits(dummy)
@@ -259,9 +264,10 @@ def _print_benchmark_log(
     )
 
 
-def _extract_logits_and_boxes(raw_outputs: Any, num_classes: int) -> Tuple[np.ndarray, np.ndarray]:
+def _extract_logits_and_boxes(raw_outputs: Any, num_classes: int) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     cls_logits = None
     box_reg = None
+    centerness = None
 
     # raw_outputs is an OpenVINO InferRequest result object
     # We iterate through the keys (output ports) to check names/shapes
@@ -274,12 +280,16 @@ def _extract_logits_and_boxes(raw_outputs: Any, num_classes: int) -> Tuple[np.nd
             cls_logits = arr
         elif "box" in name or "loc" in name or "reg" in name:
             box_reg = arr
+        elif "center" in name:
+            centerness = arr
         
         # Fallback for models with generic names but different shapes
         if cls_logits is None and arr.ndim == 3 and arr.shape[-1] == num_classes and num_classes != 4:
             cls_logits = arr
         elif box_reg is None and arr.ndim == 3 and arr.shape[-1] == 4:
             box_reg = arr
+        elif centerness is None and arr.ndim == 3 and arr.shape[-1] == 1:
+            centerness = arr
 
     if cls_logits is None or box_reg is None:
         # Final attempt: If shapes are both (1, N, 4), assume standard order [logits, boxes]
@@ -295,7 +305,7 @@ def _extract_logits_and_boxes(raw_outputs: Any, num_classes: int) -> Tuple[np.nd
                 "Ensure your model outputs are named (e.g., 'boxes' and 'scores')."
             )
 
-    return cls_logits.astype(np.float32), box_reg.astype(np.float32)
+    return cls_logits.astype(np.float32), box_reg.astype(np.float32), None if centerness is None else centerness.astype(np.float32)
 
 def main() -> None:
     args = parse_args()
@@ -339,6 +349,7 @@ def main() -> None:
 
     post_model = _build_postprocess_model(config, args.model, img_size)
     priors = _prepare_priors(post_model, img_size)
+    points_all = _prepare_anchor_free_points(post_model, img_size) if getattr(post_model, "anchor_free", False) else None
 
     score_thresh = float(args.score_thresh) if args.score_thresh is not None else float(config.get("score_thresh", 0.5))
     pre_nms_topk = int(args.pre_nms_topk) if args.pre_nms_topk is not None else int(config.get("eval_pre_nms_topk", 400))
@@ -394,7 +405,7 @@ def main() -> None:
 
             inf_start = pre_end
             raw_outputs = compiled_model({input_name: blob})
-            cls_logits_np, box_reg_np = _extract_logits_and_boxes(raw_outputs, num_classes)
+            cls_logits_np, box_reg_np, centerness_np = _extract_logits_and_boxes(raw_outputs, num_classes)
             inf_end = time.perf_counter()
 
             post_start = inf_end
@@ -402,15 +413,29 @@ def main() -> None:
             box_reg = torch.from_numpy(box_reg_np)
 
             with torch.no_grad():
-                outputs = post_model.post_process(
-                    cls_logits,
-                    box_reg,
-                    priors,
-                    img_size=img_size,
-                    score_thresh=score_thresh,
-                    pre_nms_topk=pre_nms_topk,
-                    max_detections=max_detections,
-                )
+                if getattr(post_model, "anchor_free", False):
+                    if centerness_np is None:
+                        raise RuntimeError("Anchor-free model requires centerness output.")
+                    centerness = torch.from_numpy(centerness_np)
+                    outputs = post_model.post_process(
+                        cls_logits,
+                        box_reg,
+                        centerness,
+                        points_all=points_all,
+                        score_thresh=score_thresh,
+                        pre_nms_topk=pre_nms_topk,
+                        max_detections=max_detections,
+                    )
+                else:
+                    outputs = post_model.post_process(
+                        cls_logits,
+                        box_reg,
+                        priors,
+                        img_size=img_size,
+                        score_thresh=score_thresh,
+                        pre_nms_topk=pre_nms_topk,
+                        max_detections=max_detections,
+                    )
 
             detections = outputs[0] if outputs else torch.zeros((0, 6), dtype=torch.float32)
             detections_cpu = detections.cpu()
@@ -501,3 +526,10 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+def _prepare_anchor_free_points(post_model, img_size: int):
+    dummy = torch.zeros((1, 3, img_size, img_size), dtype=torch.float32)
+    with torch.no_grad():
+        outputs = post_model.forward_logits(dummy)
+        _, _, _, feats = outputs
+        points_all = post_model._generate_points(feats, dummy.device)
+    return [p.cpu() for p in points_all]

@@ -1,4 +1,4 @@
-Model: SSDCNNStudent (CNN + FPN + SSDLite Head)
+Model: AnchorFreeCNNStudent (CNN + FPN + FCOS Head)
 
 Input:
 - Image tensor: 3 x 512 x 512
@@ -7,6 +7,7 @@ Backbone: SimpleCNNBackbone
 - Preprocessing Stages:
   - S1: ConvBNReLU(3 -> s1, k=3, s=2)
   - S2: ConvBNReLU(s1 -> s2, k=3, s=2)
+- C2 (stride 4): output of S2
 - C3 (stride 8):
   - ConvBNReLU(s2 -> c1, k=3, s=2)
   - ResidualBlock(c1)
@@ -19,9 +20,9 @@ Backbone: SimpleCNNBackbone
   - SpatialPyramidPooling(c3) [maxpool k=3/5/7, stride=1], concat + 1x1 conv + BN + ReLU
 
 FPN: SimpleFPN
-- Lateral 1x1 convs on C3/C4/C5 -> P3/P4/P5
-- Top-down: P5 -> P4 -> P3 (nearest upsample + add)
-- 3x3 conv on P3/P4/P5
+- Lateral 1x1 convs on C2/C3/C4/C5 -> P2/P3/P4/P5
+- Top-down: P5 -> P4 -> P3 -> P2 (nearest upsample + add)
+- 3x3 conv on P2/P3/P4/P5
 - Extra levels:
   - P6 = Conv3x3(stride=2) on P5
   - P7 = Conv3x3(stride=2) on ReLU(P6)
@@ -31,16 +32,21 @@ Context Gate (GlobalContextGate):
 - Gate applied to each P level
 - BatchNorm after gate per P-level
 
-Head: SSDLiteHeadWithDropout (Multi-head)
-- Dropout2d on each FPN feature
-- Classification head per FPN level
-- Regression head per FPN level
-- Outputs:
-  - cls_logits: [B, N, num_classes]
-  - bbox_regression: [B, N, 4]
+Head: AnchorFreeHead (FCOS-style, depthwise separable)
+- 3x depthwise-separable conv layers per tower (cls/reg)
+- Outputs per level:
+  - cls_logits: [B, H*W, num_classes(no-bg)]
+  - bbox_regression: [B, H*W, 4] (l,t,r,b distances)
+  - centerness: [B, H*W, 1]
+- Dropout2d on FPN features before head
+
+Loss:
+- Classification: Focal Loss (sigmoid)
+- Regression: GIoU Loss
+- Centerness: BCEWithLogits
 
 Post-process:
-- Softmax scores
+- score = sigmoid(cls) * sigmoid(centerness)
 - Score thresholding
 - pre_nms_topk
 - Batched NMS (class-aware)
@@ -49,10 +55,13 @@ Post-process:
 Key Config Params:
 - student_model = "cnn"
 - student_cnn_stem_channels = [16, 32]
-- student_cnn_base_channels = [32, 64, 128]
-- student_cnn_fpn_channels = 128
+- student_cnn_base_channels = [24, 48, 96]
+- student_cnn_fpn_channels = 64
 - student_cnn_fc_dim = 256
 - student_cnn_head_dropout = 0.1
-- student_cnn_aspect_ratios = [[2], [2,3], [2,3], [2], [2]]
-- student_cnn_s_min = 0.07
+- student_cnn_head_num_convs = 3
+- student_cnn_head_depthwise = true
+- student_cnn_fcos_strides = [4, 8, 16, 32, 64, 128]
+- student_cnn_fcos_ranges = [[0, 32], [32, 64], [64, 128], [128, 256], [256, 512], [512, 1e8]]
+- student_cnn_s_min = 0.03
 - student_cnn_s_max = 0.95

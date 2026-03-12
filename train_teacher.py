@@ -151,9 +151,11 @@ def main():
         dummy_input = torch.randn(1, 3, img_size, img_size).to(device)
         with torch.no_grad():
             total_madds, total_params = profile(model_copy, inputs=(dummy_input,), verbose=False)
+        total_flops = total_madds * 2
         print(f"\n--- Teacher Model Complexity ---")
         print(f"Total Parameters: {total_params / 1e6:.2f} M")
         print(f"Total MAdds (Giga): {total_madds / 1e9:.2f} G")
+        print(f"Total FLOPs (Giga): {total_flops / 1e9:.2f} G")
         print(f"--------------------------------\n")
         del model_copy, dummy_input # Cleanup
         gc.collect()

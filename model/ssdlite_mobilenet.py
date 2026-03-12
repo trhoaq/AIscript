@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model.mobilenetv3_torch import _make_divisible, load_pretrained_from_timm, mobilenet_v3_large
-from model.utils import _cxcywh_to_xyxy, _xyxy_to_cxcywh, DefaultBoxGenerator, box_iou, nms
+from model.utils import _cxcywh_to_xyxy, _xyxy_to_cxcywh, DefaultBoxGenerator, box_iou, generalized_iou, nms
 
 
 class ConvBNReLU6(nn.Module):
@@ -306,9 +306,12 @@ class SSDMobile(nn.Module):
                 continue
             total_pos += num_pos
 
-            loc_t = self._encode(gt_boxes[best_gt_idx[positives]], priors[positives])
+            matched_gt = gt_boxes[best_gt_idx[positives]]
+            loc_t = self._encode(matched_gt, priors[positives])
             loc_p = box_reg[b][positives]
-            loc_loss += F.smooth_l1_loss(loc_p, loc_t, reduction="sum")
+            pred_boxes = self._decode(loc_p, priors[positives])
+            giou = generalized_iou(pred_boxes, matched_gt)
+            loc_loss += (1.0 - giou).sum()
 
             cls_targets = torch.zeros(priors.size(0), dtype=torch.long, device=device)
             cls_targets[positives] = gt_labels[best_gt_idx[positives]]

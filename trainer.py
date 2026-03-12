@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import gc
+import math
 from tqdm import tqdm
 import os
 from typing import List, Dict, Any
@@ -139,7 +140,18 @@ class DetectorTrainer:
             lr=config.get('lr', 1e-3), 
             weight_decay=config.get('weight_decay', 1e-4)
         )
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=config.get('epochs', 100))
+        total_epochs = int(config.get('epochs', 100))
+        warmup_epochs = int(config.get('warmup_epochs', 0))
+
+        def _lr_lambda(epoch: int) -> float:
+            if warmup_epochs > 0 and epoch < warmup_epochs:
+                return float(epoch + 1) / float(warmup_epochs)
+            progress = max(0, epoch - warmup_epochs)
+            denom = max(1, total_epochs - warmup_epochs)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress / denom))
+            return cosine
+
+        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=_lr_lambda)
         
         # --- Metrics and Early Stopping ---
         self.score_thresh = config.get('score_thresh', 0.05) # From config.json
@@ -191,17 +203,20 @@ class DetectorTrainer:
             # Forward Student
             self.optimizer.zero_grad()
             
-            student_logits, student_regs, student_feats = self.model.forward_logits(images)
-            
-            if hasattr(self.model, "generate_priors"):
-                priors = self.model.generate_priors(student_feats, images)
+            outputs = self.model.forward_logits(images)
+            if getattr(self.model, "anchor_free", False):
+                student_logits, student_regs, student_ctr, student_feats = outputs
+                gt_loss_dict = self.model.compute_loss(student_logits, student_regs, student_ctr, student_feats, targets)
+                loss = gt_loss_dict["bbox_regression"] + gt_loss_dict["classification"] + gt_loss_dict["centerness"]
             else:
-                feat_sizes = [(f.size(2), f.size(3)) for f in student_feats]
-                priors = self.model.anchor_generator.generate(feat_sizes, self.model.img_size, student_logits.device)
-            gt_loss_dict = self.model.multibox_loss(student_logits, student_regs, targets, priors)
-            
-            # Ground truth loss
-            loss = gt_loss_dict["bbox_regression"] + gt_loss_dict["classification"]
+                student_logits, student_regs, student_feats = outputs
+                if hasattr(self.model, "generate_priors"):
+                    priors = self.model.generate_priors(student_feats, images)
+                else:
+                    feat_sizes = [(f.size(2), f.size(3)) for f in student_feats]
+                    priors = self.model.anchor_generator.generate(feat_sizes, self.model.img_size, student_logits.device)
+                gt_loss_dict = self.model.multibox_loss(student_logits, student_regs, targets, priors)
+                loss = gt_loss_dict["bbox_regression"] + gt_loss_dict["classification"]
 
             # Knowledge Distillation Loss
             if self.teacher_model and self.distill_criterion and self.feature_adapters:
@@ -276,31 +291,45 @@ class DetectorTrainer:
                 # Ensure targets are tensors and on correct device
                 original_targets = [{k: torch.as_tensor(v).to(self.device) for k, v in t.items()} for t in targets] # Ground Truth
 
-                student_logits, student_regs, student_feats = self.model.forward_logits(images)
-                
-                if hasattr(self.model, "generate_priors"):
-                    priors = self.model.generate_priors(student_feats, images)
+                outputs = self.model.forward_logits(images)
+                if getattr(self.model, "anchor_free", False):
+                    student_logits, student_regs, student_ctr, student_feats = outputs
+                    gt_loss_dict = self.model.compute_loss(student_logits, student_regs, student_ctr, student_feats, original_targets)
+                    loss = gt_loss_dict["bbox_regression"] + gt_loss_dict["classification"] + gt_loss_dict["centerness"]
                 else:
-                    feat_sizes = [(f.size(2), f.size(3)) for f in student_feats]
-                    priors = self.model.anchor_generator.generate(feat_sizes, self.model.img_size, student_logits.device)
-                
-                gt_loss_dict = self.model.multibox_loss(student_logits, student_regs, original_targets, priors)
-                
-                loss = gt_loss_dict["bbox_regression"] + gt_loss_dict["classification"]
+                    student_logits, student_regs, student_feats = outputs
+                    if hasattr(self.model, "generate_priors"):
+                        priors = self.model.generate_priors(student_feats, images)
+                    else:
+                        feat_sizes = [(f.size(2), f.size(3)) for f in student_feats]
+                        priors = self.model.anchor_generator.generate(feat_sizes, self.model.img_size, student_logits.device)
+                    gt_loss_dict = self.model.multibox_loss(student_logits, student_regs, original_targets, priors)
+                    loss = gt_loss_dict["bbox_regression"] + gt_loss_dict["classification"]
 
                 total_val_loss += loss.item()
                 pbar.set_postfix(val_loss=loss.item())
 
                 # Post-process model outputs for mAP calculation
-                detections = self.model.post_process(
-                    student_logits,
-                    student_regs,
-                    priors,
-                    self.model.img_size,
-                    self.eval_score_thresh,
-                    pre_nms_topk=self.eval_pre_nms_topk,
-                    max_detections=self.eval_max_detections,
-                )
+                if getattr(self.model, "anchor_free", False):
+                    detections = self.model.post_process(
+                        student_logits,
+                        student_regs,
+                        student_ctr,
+                        student_feats,
+                        score_thresh=self.eval_score_thresh,
+                        pre_nms_topk=self.eval_pre_nms_topk,
+                        max_detections=self.eval_max_detections,
+                    )
+                else:
+                    detections = self.model.post_process(
+                        student_logits,
+                        student_regs,
+                        priors,
+                        self.model.img_size,
+                        self.eval_score_thresh,
+                        pre_nms_topk=self.eval_pre_nms_topk,
+                        max_detections=self.eval_max_detections,
+                    )
                 
                 for i in range(len(detections)):
                     # Keep on original device (GPU) to use GPU acceleration for IoU later
