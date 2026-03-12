@@ -326,7 +326,10 @@ def main():
         print("No student checkpoint found. Starting from scratch.")
 
     # 6. Training Loop
-    print(f"Starting training SSDLite GhostNetV3 {student_width:.1f}x on {device}...")
+    if student_model_kind == "cnn":
+        print(f"Starting training SSDLite CNN student on {device}...")
+    else:
+        print(f"Starting training SSDLite GhostNetV3 {student_width:.1f}x on {device}...")
     for epoch in range(start_epoch + 1, trainer_config['epochs'] + 1):
         train_loss = trainer.train_epoch(epoch)
         if train_loss is not None:

@@ -32,7 +32,7 @@ class ResidualBlock(nn.Module):
         self.conv1 = ConvBNReLU(channels, channels, kernel_size=3, stride=1)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
-        self.drop = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+        self.drop = nn.Dropout2d(p=dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.conv1(x)
@@ -43,17 +43,12 @@ class ResidualBlock(nn.Module):
 
 
 class SpatialPyramidPooling(nn.Module):
-    """SPP layer with stride-2 maxpools to replace downsampling maxpool."""
+    """SPP layer (stride=1) applied at C5 before FPN."""
 
     def __init__(self, channels: int) -> None:
         super().__init__()
-        self.pools = nn.ModuleList(
-            [
-                nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
-                nn.MaxPool2d(kernel_size=5, stride=1, padding=2),
-                nn.MaxPool2d(kernel_size=7, stride=1, padding=4),
-            ]
-        )
+        self.pool_specs = (3, 5, 7)
+        self.pools = nn.ModuleList([nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2) for k in self.pool_specs])
         self.fuse = nn.Sequential(
             nn.Conv2d(channels * (len(self.pools) + 1), channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(channels),
@@ -61,7 +56,7 @@ class SpatialPyramidPooling(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = [x]+[p(x) for p in self.pools]
+        feats = [x] + [p(x) for p in self.pools]
         x = torch.cat(feats, dim=1)
         return self.fuse(x)
 
@@ -147,22 +142,19 @@ class SimpleFPN(nn.Module):
 
 
 class GlobalContextGate(nn.Module):
-    """Per-level gate: mỗi FPN level có gate riêng từ pooling của chính nó."""
+    """Global gate từ C5: GAP -> FC(ReLU) -> FC -> sigmoid."""
 
-    def __init__(self, in_channels: int, hidden_dim: int, out_channels: int, num_levels: int) -> None:
+    def __init__(self, in_channels: int, hidden_dim: int, out_channels: int) -> None:
         super().__init__()
-        self.num_levels = num_levels
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc1 = nn.Linear(in_channels, hidden_dim)
-            # Mỗi level output 1 vector gate riêng                                                          self.fc2 = nn.Linear(hidden_dim, out_channels * num_levels)
-        self.out_channels = out_channels
+        self.fc2 = nn.Linear(hidden_dim, out_channels)
 
-    def forward(self, c5: torch.Tensor) -> List[torch.Tensor]:                                                                   
-        x = self.pool(c5).flatten(1)          # (B, C)
-        x = F.relu(self.fc1(x), inplace=True) # (B, hidden)
-        x = torch.sigmoid(self.fc2(x))        # (B, out_channels * num_lev                                            # Tách thành list gate per level
-        gates = x.chunk(self.num_levels, dim=1)
-        return [g.unsqueeze(-1).unsqueeze(-1) for g in gates]  # [(B,C,1,1), ...]
+    def forward(self, c5: torch.Tensor) -> torch.Tensor:
+        x = self.pool(c5).flatten(1)
+        x = F.relu(self.fc1(x), inplace=True)
+        x = torch.sigmoid(self.fc2(x))
+        return x.unsqueeze(-1).unsqueeze(-1)
 
 
 class CNNFPNBackbone(nn.Module):
@@ -170,7 +162,7 @@ class CNNFPNBackbone(nn.Module):
         super().__init__()
         self.backbone = SimpleCNNBackbone(base_channels, stem_channels=stem_channels)
         self.fpn = SimpleFPN(self.backbone.out_channels, fpn_channels)
-        self.context = GlobalContextGate(self.backbone.out_channels[-1], fc_dim, fpn_channels, num_levels=5)
+        self.context = GlobalContextGate(self.backbone.out_channels[-1], fc_dim, fpn_channels)
         self.gate_norms = nn.ModuleList([nn.BatchNorm2d(fpn_channels) for _ in range(5)])
         self.out_channels = [fpn_channels] * 5
 
@@ -178,7 +170,7 @@ class CNNFPNBackbone(nn.Module):
         c3, c4, c5 = self.backbone(x)
         pyramid = self.fpn([c3, c4, c5])
         gate = self.context(c5)
-        gated = [p * g for p, g in zip(pyramid, gate)]
+        gated = [p * gate for p in pyramid]
         return [bn(feat) for bn, feat in zip(self.gate_norms, gated)]
 
 

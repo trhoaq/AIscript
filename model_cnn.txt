@@ -16,7 +16,7 @@ Backbone: SimpleCNNBackbone
 - C5 (stride 32):
   - ConvBNReLU(c2 -> c3, k=3, s=2)
   - ResidualBlock(c3)
-  - SpatialPyramidPooling(c3) [maxpool k=3/5/7, stride=2], concat + 1x1 conv + BN + ReLU
+  - SpatialPyramidPooling(c3) [maxpool k=3/5/7, stride=1], concat + 1x1 conv + BN + ReLU
 
 FPN: SimpleFPN
 - Lateral 1x1 convs on C3/C4/C5 -> P3/P4/P5
