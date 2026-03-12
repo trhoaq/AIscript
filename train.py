@@ -138,6 +138,9 @@ def main():
     coco_val_split = config.get("coco_val_split", config.get("val_split", "val2017"))
     eval_interval = max(1, int(config.get("eval_interval", 1)))
     use_kd = bool(config.get("use_kd", True))
+    if student_model_kind == "cnn" and use_kd:
+        print("Anchor-free CNN student selected. Disabling SSDMobile teacher (use_kd=False).")
+        use_kd = False
     load_teacher_checkpoint_enabled = bool(config.get("load_teacher_checkpoint", True))
     kd_teacher_model_path = str(
         config.get(
