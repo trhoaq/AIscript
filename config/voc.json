@@ -1,0 +1,13 @@
+{
+  "voc_root": "./data",
+  "voc_years": ["5"],
+  "train_split": "train",
+  "val_split": "val",
+  "obj_classes": [
+    "background",
+    "h",
+    "f",
+    "s"
+  ]
+}
+

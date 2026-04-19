@@ -1,0 +1,8 @@
+{
+  "coco_root": "./data/coco",
+  "coco_train_split": "train",
+  "coco_val_split": "val",
+  "obj_classes": [
+    "background","target"
+  ]
+}

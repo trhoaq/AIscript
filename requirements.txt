@@ -1,0 +1,15 @@
+torch
+torchmetrics[detection]
+albumentations
+opencv-python
+tqdm
+requests
+numpy
+timm
+thop
+wandb
+onnx
+openvino
+nncf
+
+
